@@ -18,6 +18,25 @@ Part of the [Pify suite](https://github.com/pifydev). Install with [`pify instal
 
 Fail-closed everywhere: rule-evaluation errors block; ASK without a UI (headless/CI) denies.
 
+## Secret files (v0.2)
+
+Credentials are the one thing yolo mode does **not** wave through — auto-approving speed is worth it, auto-approving your AWS keys into a prompt is not. Any `read`/`edit`/`write` on secret material, and any bash command that names it, asks first in both modes:
+
+`.env` (and `.env.*`, but not `.env.example`/`.sample`/`.template`) · `~/.ssh/*` and `id_rsa`/`id_ed25519`-style keys (`.pub` halves are fine) · `.aws/credentials` · `.pi/agent/auth.json`, `.claude/.credentials.json` · `.npmrc`, `.pypirc`, `.netrc`, `.git-credentials` · `~/.config/gh/hosts.yml` · `*.pem`, `*.key`, `*.p12`, `*.pfx` · `secrets.json`/`credentials.yaml`
+
+A user rule opts a project out: `{ "pattern": "*/.env", "action": "allow" }`.
+
+## Checkpoints (v0.2)
+
+Before every risky bash command in a git repo, the trail records a `git stash create` checkpoint — a dangling commit holding the working tree exactly as it was, kept alive under `refs/pify/yolo/`. It writes nothing to your tree, index, or stash list. `/yolo trail` prints the recovery line next to the command:
+
+```
+#7 2026-09-06 11:00:12 bash  git reset --hard @a1b2c3d4
+    ↩ git stash apply 9f8e7d6c5b4a
+```
+
+That covers what `/yolo undo` can't: damage done by a command rather than by an `edit`/`write`.
+
 ## The undo trail
 
 Always on, in both modes:

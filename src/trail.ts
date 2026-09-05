@@ -80,6 +80,7 @@ export function recordBash(
   cwd: string,
   gitHead: string | null,
   now: number,
+  stashSha: string | null = null,
 ): void {
   try {
     append(dir, {
@@ -91,6 +92,7 @@ export function recordBash(
       existed: false,
       cwd,
       ...(gitHead ? { gitHead } : {}),
+      ...(stashSha ? { stashSha } : {}),
     });
   } catch {
     // trail must never break the tool call
@@ -142,7 +144,9 @@ export function formatTrail(entries: TrailEntry[], limit: number): string {
       if (e.type === "file") {
         return `#${e.seq} ${when} file  ${e.target}${e.existed ? "" : " (new file)"}`;
       }
-      return `#${e.seq} ${when} bash  ${e.target}${e.gitHead ? ` @${e.gitHead.slice(0, 8)}` : ""}`;
+      const head = e.gitHead ? ` @${e.gitHead.slice(0, 8)}` : "";
+      const stash = e.stashSha ? `\n    ↩ git stash apply ${e.stashSha}` : "";
+      return `#${e.seq} ${when} bash  ${e.target}${head}${stash}`;
     })
     .join("\n");
 }

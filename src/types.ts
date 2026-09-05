@@ -30,6 +30,8 @@ export interface TrailEntry {
   existed: boolean;
   cwd?: string;
   gitHead?: string;
+  /** bash: dangling `git stash create` commit holding the pre-command tree. */
+  stashSha?: string;
 }
 
 export interface BranchEntryLike {

@@ -13,6 +13,12 @@
  * headless ASK becomes deny. User rules in .pi/yolo.json (wildcard,
  * last-match-wins) can retune ASK/ALLOW but never the catastrophic floor.
  *
+ * v0.2 adds two things yolo mode deliberately does not stand down for:
+ * secret material (.env, ssh keys, cloud/registry credentials) asks before
+ * any read/edit/write or naming command, and every risky bash command gets a
+ * `git stash create` checkpoint recorded on the trail so command damage —
+ * not just file edits — has a way back.
+ *
  * Design synthesis: three-tier rules (pi-yolo-seatbelt), fail-closed +
  * reject-with-reason + wildcard rules (@zhushanwen/pi-permission),
  * /yolo session toggle (valdo766hi).
@@ -26,7 +32,7 @@ import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { evaluateCommand, parseUserRules } from "../src/rules.ts";
+import { evaluateCommand, evaluatePath, parseUserRules } from "../src/rules.ts";
 import { formatTrail, readManifest, recordBash, recordPreImage, trailDir, undo } from "../src/trail.ts";
 import { isRecord, type Mode, type UserRule } from "../src/types.ts";
 
@@ -71,6 +77,63 @@ export default function yolo(pi: ExtensionAPI) {
     }
   }
 
+  /**
+   * Snapshot the working tree into a dangling commit before a risky command.
+   * `git stash create` writes nothing to the tree, the index, or the stash
+   * list — it just gives us a sha to come back to. A ref keeps it out of gc's
+   * reach; empty output means there was nothing to save.
+   */
+  function gitCheckpoint(cwd: string, now: number): string | null {
+    try {
+      const sha = execFileSync("git", ["stash", "create"], {
+        cwd,
+        encoding: "utf8",
+        timeout: 5000,
+        windowsHide: true,
+      }).trim();
+      if (!/^[0-9a-f]{7,40}$/.test(sha)) return null;
+      try {
+        execFileSync("git", ["update-ref", `refs/pify/yolo/${now}`, sha], {
+          cwd,
+          timeout: 5000,
+          windowsHide: true,
+        });
+      } catch {
+        // unreachable-but-recent commits still survive the default gc window
+      }
+      return sha;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Confirmation gate for a file path (secret material). */
+  async function guardPath(
+    ctx: UiContext,
+    path: string,
+    rule: string,
+    action: "ask" | "block",
+  ): Promise<{ block: true; reason: string } | undefined> {
+    if (action === "block") {
+      return { block: true, reason: `yolo guard blocked access to ${path} (${rule}).` };
+    }
+    if (!ctx.hasUI) {
+      return {
+        block: true,
+        reason: `yolo guard: ${path} holds secret material (${rule}) and there is no UI to confirm (fail-closed deny).`,
+      };
+    }
+    const approved = await ctx.ui.confirm(
+      "Secret file",
+      `${path}\n\nRule: ${rule}. Allow this access?`,
+    );
+    if (approved) return undefined;
+    return {
+      block: true,
+      reason: `The user declined access to ${path} (${rule}). Continue without its contents; ask for the value you need instead.`,
+    };
+  }
+
   function loadUserRules(cwd: string): void {
     try {
       userRules = parseUserRules(JSON.parse(readFileSync(join(cwd, ".pi", "yolo.json"), "utf8")));
@@ -82,11 +145,18 @@ export default function yolo(pi: ExtensionAPI) {
   // ── The gate + the trail ─────────────────────────────────────────────
 
   pi.on("tool_call", async (event, ctx) => {
-    // Trail: pre-image every file mutation, in both modes.
-    if (event.toolName === "edit" || event.toolName === "write") {
+    // Secret material is checked in BOTH modes: yolo trades safety for speed,
+    // not for handing credentials to a model.
+    if (event.toolName === "read" || event.toolName === "edit" || event.toolName === "write") {
       const path = (event as { input?: { path?: unknown } }).input?.path;
-      if (typeof path === "string" && dir) {
-        recordPreImage(dir, path, Date.now());
+      if (typeof path === "string") {
+        const verdict = evaluatePath(path, userRules);
+        if (verdict.action !== "allow") {
+          const denial = await guardPath(ctx, path, verdict.rule, verdict.action);
+          if (denial) return denial;
+        }
+        // Trail: pre-image every file mutation, in both modes.
+        if (event.toolName !== "read" && dir) recordPreImage(dir, path, Date.now());
       }
       return undefined;
     }
@@ -98,13 +168,16 @@ export default function yolo(pi: ExtensionAPI) {
     }
 
     const verdict = evaluateCommand(command, userRules);
+    const touchesSecret = verdict.rule.startsWith("secret:");
 
-    // Log risky commands (and everything in yolo mode) to the trail.
-    if (dir && (mode === "yolo" ? verdict.action !== "allow" : verdict.action !== "allow")) {
-      recordBash(dir, command, ctx.cwd, gitHead(ctx.cwd), Date.now());
+    // Log risky commands, with a checkpoint of the tree as it was.
+    if (dir && verdict.action !== "allow") {
+      const now = Date.now();
+      recordBash(dir, command, ctx.cwd, gitHead(ctx.cwd), now, gitCheckpoint(ctx.cwd, now));
     }
 
-    if (mode === "yolo") return undefined; // gate stands down; trail recorded
+    // The gate stands down in yolo mode — except for secrets.
+    if (mode === "yolo" && !touchesSecret) return undefined;
 
     if (verdict.action === "allow") return undefined;
 
@@ -123,7 +196,7 @@ export default function yolo(pi: ExtensionAPI) {
       };
     }
     const approved = await ctx.ui.confirm(
-      "Destructive command",
+      touchesSecret ? "Command touches secret material" : "Destructive command",
       `${command}\n\nRule: ${verdict.rule}. Run it?`,
     );
     if (approved) return undefined;
