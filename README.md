@@ -66,7 +66,7 @@ Measured over OpenRouter on six commands (three genuinely destructive, three rea
 | GPT-5.6 terra / sol | 5/6 | 1 |
 | Claude Opus 5 | 4/6 | 1 |
 | Gemini 3.1 Pro | 2/6 | 4 |
-| Qwen3 235B | 3/6 | 3 |
+| Qwen3 235B | 2/6 | 4 |
 
 Every miss fell back to *allow* — no run ever downgraded a command the rules had already flagged. Weaker models simply give you less extra protection.
 
