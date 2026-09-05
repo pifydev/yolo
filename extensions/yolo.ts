@@ -24,7 +24,11 @@
  * /yolo session toggle (valdo766hi).
  */
 import {
+  DefaultResourceLoader,
+  SessionManager,
+  createAgentSession,
   getAgentDir,
+  type AgentSession,
   type ExtensionAPI,
   type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
@@ -32,16 +36,29 @@ import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
+import {
+  CLASSIFY_SYSTEM_PROMPT,
+  applyClassification,
+  buildClassifyPrompt,
+  needsClassification,
+  parseClassification,
+  type Classification,
+} from "../src/classify.ts";
 import { evaluateCommand, evaluatePath, parseUserRules } from "../src/rules.ts";
 import { formatTrail, readManifest, recordBash, recordPreImage, trailDir, undo } from "../src/trail.ts";
 import { isRecord, type Mode, type UserRule } from "../src/types.ts";
 
 const MODE_ENTRY = "yolo-mode";
+const CLASSIFIER_ENTRY = "yolo-classifier";
+/** In front of every bash call: a slow answer costs seconds, not minutes. */
+const CLASSIFY_TIMEOUT_MS = 20_000;
 
 type UiContext = ExtensionContext;
 
 export default function yolo(pi: ExtensionAPI) {
   let mode: Mode = "guard";
+  /** Opt-in: layer 3 costs a model call on unfamiliar commands. */
+  let classifierEnabled = false;
   let userRules: UserRule[] = [];
   let dir = "";
 
@@ -134,6 +151,56 @@ export default function yolo(pi: ExtensionAPI) {
     };
   }
 
+  /**
+   * Ask a model whether an unmatched command is risky. Short timeout: this
+   * sits in front of every bash call, so a slow answer must cost the session
+   * seconds, not minutes — and a timeout is simply "no opinion".
+   */
+  async function classifyCommand(ctx: UiContext, command: string): Promise<Classification> {
+    let session: AgentSession | null = null;
+    try {
+      const created = await createAgentSession({
+        sessionManager: SessionManager.inMemory(ctx.cwd),
+        model: ctx.model as never,
+        tools: [],
+        resourceLoader: new DefaultResourceLoader({
+          cwd: ctx.cwd,
+          agentDir: getAgentDir(),
+          noExtensions: true,
+          noPromptTemplates: true,
+          noThemes: true,
+          // Replace the coding-agent prompt rather than append to it: with
+          // the default prompt in place, models answer a classification
+          // request with a markdown explanation instead of the JSON line.
+          systemPrompt: CLASSIFY_SYSTEM_PROMPT.join(" "),
+        } as never),
+      });
+      session = created.session;
+      await session.prompt(buildClassifyPrompt(command, ctx.cwd), {
+        signal: AbortSignal.timeout(CLASSIFY_TIMEOUT_MS),
+      } as never);
+      const messages = session.messages as Array<{ role?: string; content?: Array<{ type?: string; text?: string }> }>;
+      const last = [...messages].reverse().find((m) => m.role === "assistant");
+      const text = (last?.content ?? [])
+        .filter((part) => part.type === "text" && typeof part.text === "string")
+        .map((part) => part.text)
+        .join("");
+      return parseClassification(text);
+    } catch (err) {
+      return {
+        risk: "safe",
+        reason: `classifier unavailable (${err instanceof Error ? err.message : String(err)})`,
+        fallback: true,
+      };
+    } finally {
+      try {
+        session?.dispose();
+      } catch {
+        // best-effort
+      }
+    }
+  }
+
   function loadUserRules(cwd: string): void {
     try {
       userRules = parseUserRules(JSON.parse(readFileSync(join(cwd, ".pi", "yolo.json"), "utf8")));
@@ -167,7 +234,17 @@ export default function yolo(pi: ExtensionAPI) {
       return { block: true, reason: "yolo guard: bash call without a command (fail-closed)." };
     }
 
-    const verdict = evaluateCommand(command, userRules);
+    let verdict = evaluateCommand(command, userRules);
+
+    // Layer 3: a model looks at what the regexes had no opinion about. It can
+    // only escalate allow → ask, so a talked-into-it classifier cannot open
+    // the gate, and a broken one leaves the deterministic verdict standing.
+    if (classifierEnabled && verdict.action === "allow" && needsClassification(command)) {
+      const classification = await classifyCommand(ctx, command);
+      const escalated = applyClassification(verdict.action, classification);
+      if (escalated.rule) verdict = { action: "ask", rule: escalated.rule };
+    }
+
     const touchesSecret = verdict.rule.startsWith("secret:");
 
     // Log risky commands, with a checkpoint of the tree as it was.
@@ -217,10 +294,14 @@ export default function yolo(pi: ExtensionAPI) {
     dir = trailDir(getAgentDir(), ctx.cwd);
     loadUserRules(ctx.cwd);
     mode = "guard";
+    classifierEnabled = false;
     for (const entry of ctx.sessionManager.getBranch()) {
       const e = entry as { type?: string; customType?: string; data?: unknown };
       if (e.type === "custom" && e.customType === MODE_ENTRY && isRecord(e.data)) {
         if (e.data.mode === "yolo" || e.data.mode === "guard") mode = e.data.mode;
+      }
+      if (e.type === "custom" && e.customType === CLASSIFIER_ENTRY && isRecord(e.data)) {
+        if (typeof e.data.enabled === "boolean") classifierEnabled = e.data.enabled;
       }
     }
     updateFooter(ctx);
@@ -228,10 +309,14 @@ export default function yolo(pi: ExtensionAPI) {
 
   pi.on("session_tree", async (_event, ctx) => {
     mode = "guard";
+    classifierEnabled = false;
     for (const entry of ctx.sessionManager.getBranch()) {
       const e = entry as { type?: string; customType?: string; data?: unknown };
       if (e.type === "custom" && e.customType === MODE_ENTRY && isRecord(e.data)) {
         if (e.data.mode === "yolo" || e.data.mode === "guard") mode = e.data.mode;
+      }
+      if (e.type === "custom" && e.customType === CLASSIFIER_ENTRY && isRecord(e.data)) {
+        if (typeof e.data.enabled === "boolean") classifierEnabled = e.data.enabled;
       }
     }
     updateFooter(ctx);
@@ -244,7 +329,7 @@ export default function yolo(pi: ExtensionAPI) {
   // ── Command ──────────────────────────────────────────────────────────
 
   pi.registerCommand("yolo", {
-    description: "Toggle auto-approve: /yolo [on|off|status|trail|undo [n]]",
+    description: "Toggle auto-approve: /yolo [on|off|status|trail|undo [n]|classifier on|off]",
     handler: async (args, ctx) => {
       const [route, countRaw] = (args ?? "").trim().toLowerCase().split(/\s+/);
       switch (route || "toggle") {
@@ -264,10 +349,38 @@ export default function yolo(pi: ExtensionAPI) {
             [
               `Mode: ${mode === "yolo" ? "⚡ YOLO (gate off)" : "🛡 guard"}`,
               `User rules: ${userRules.length} (.pi/yolo.json)`,
+              `AI classifier: ${classifierEnabled ? "on" : "off"} (/yolo classifier on)`,
               `Trail: ${entries.length} entries — /yolo trail to view, /yolo undo [n] to restore`,
             ].join("\n"),
             "info",
           );
+          return;
+        }
+        case "classifier": {
+          const value = (countRaw ?? "").toLowerCase();
+          if (value !== "on" && value !== "off") {
+            if (ctx.hasUI) {
+              ctx.ui.notify(
+                [
+                  `AI classifier: ${classifierEnabled ? "on" : "off"}.`,
+                  "When on, commands no rule matched are read by a model, which can escalate them to a confirmation — never to an approval.",
+                  "Usage: /yolo classifier <on|off>",
+                ].join("\n"),
+                "info",
+              );
+            }
+            return;
+          }
+          classifierEnabled = value === "on";
+          pi.appendEntry(CLASSIFIER_ENTRY, { enabled: classifierEnabled });
+          if (ctx.hasUI) {
+            ctx.ui.notify(
+              classifierEnabled
+                ? "AI classifier ON — unmatched commands get a second opinion before they run."
+                : "AI classifier OFF.",
+              "info",
+            );
+          }
           return;
         }
         case "trail": {
@@ -305,7 +418,7 @@ export default function yolo(pi: ExtensionAPI) {
           return;
         }
         default:
-          if (ctx.hasUI) ctx.ui.notify("Usage: /yolo [on|off|status|trail|undo [n]]", "warning");
+          if (ctx.hasUI) ctx.ui.notify("Usage: /yolo [on|off|status|trail|undo [n]|classifier on|off]", "warning");
       }
     },
   });

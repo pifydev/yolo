@@ -4,6 +4,11 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from "no
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  applyClassification,
+  needsClassification,
+  parseClassification,
+} from "../src/classify.ts";
+import {
   evaluateCommand,
   evaluatePath,
   parseUserRules,
@@ -239,4 +244,79 @@ test("v0.2 trail records the stash checkpoint and shows recovery", () => {
   } finally {
     rmSync(base, { recursive: true, force: true });
   }
+});
+
+test("v0.3 needsClassification skips the obvious, looks at the rest", () => {
+  for (const cmd of ["git status", "ls -la", "cat README.md", "bun test", "grep -r foo src"]) {
+    assert.equal(needsClassification(cmd), false, cmd);
+  }
+  for (const cmd of [
+    "find . -name '*.ts' -exec sed -i 's/a/b/' {} +",
+    "npx some-unknown-tool --write",
+    "docker system prune -af",
+    "git status && rm -rf build",
+    "cat file | xargs rm",
+  ]) {
+    assert.equal(needsClassification(cmd), true, cmd);
+  }
+  assert.equal(needsClassification("   "), false);
+});
+
+test("v0.3 parseClassification reads the shapes models emit", () => {
+  assert.deepEqual(parseClassification('{"risk":"risky","reason":"edits files in place"}'), {
+    risk: "risky",
+    reason: "edits files in place",
+    fallback: false,
+  });
+  assert.equal(parseClassification('{"risk":"safe","reason":"read-only"}').risk, "safe");
+  assert.equal(parseClassification('{"verdict":"dangerous"}').risk, "risky");
+  assert.equal(parseClassification('{"risky": true}').risk, "risky");
+  assert.equal(parseClassification('{"risky": false}').risk, "safe");
+  assert.equal(parseClassification("This command is destructive.").risk, "risky");
+  // unreadable answers are marked as fallback, never as a fresh opinion
+  assert.equal(parseClassification("").fallback, true);
+  assert.equal(parseClassification("who knows").fallback, true);
+  assert.equal(parseClassification("safe or dangerous, hard to say").fallback, true);
+});
+
+test("v0.3 the classifier can only escalate, never approve", () => {
+  const risky = { risk: "risky" as const, reason: "deletes build output", fallback: false };
+  const safe = { risk: "safe" as const, reason: "read-only", fallback: false };
+  const broken = { risk: "safe" as const, reason: "timeout", fallback: true };
+
+  assert.deepEqual(applyClassification("allow", risky), {
+    action: "ask",
+    rule: "classifier:deletes build output",
+  });
+  assert.deepEqual(applyClassification("allow", safe), { action: "allow", rule: null });
+  // a broken classifier leaves the deterministic verdict alone
+  assert.deepEqual(applyClassification("allow", broken), { action: "allow", rule: null });
+  // and it can never soften an ask or a block, whatever it says
+  assert.deepEqual(applyClassification("ask", safe), { action: "ask", rule: null });
+  assert.deepEqual(applyClassification("block", safe), { action: "block", rule: null });
+});
+
+test("v0.3 parseClassification reads prose answers, not just JSON", () => {
+  // observed live: the model ignores the format and writes markdown
+  const markdown = [
+    "The command is a **build and deployment script**:",
+    "1. Runs `npm run build`",
+    "2. Copies `dist/*` into `/var/www/html/`, outside the project.",
+    "",
+    "### Classification: **RISKY**",
+  ].join("\n");
+  const verdict = parseClassification(markdown);
+  assert.equal(verdict.risk, "risky");
+  assert.equal(verdict.fallback, false);
+  assert.ok(!verdict.reason.includes("**"));
+
+  assert.equal(parseClassification("Risk: safe — it only reads files.").risk, "safe");
+  assert.equal(parseClassification("Verdict: DANGEROUS").risk, "risky");
+  // the conclusion at the end wins over words used along the way
+  assert.equal(
+    parseClassification("This looks SAFE at first glance, but it deletes the volume. RISKY").risk,
+    "risky",
+  );
+  // still no opinion when there is genuinely none
+  assert.equal(parseClassification("I am not sure what this does.").fallback, true);
 });

@@ -45,6 +45,31 @@ Always on, in both modes:
 - Risky bash commands are logged with cwd, timestamp, and git HEAD.
 - `/yolo trail` shows history; `/yolo undo [n]` restores the newest n file changes (with a confirmation listing exactly what will be touched). Files that didn't exist before are deleted; bash effects are logged but not undoable.
 
+## AI classifier (v0.3, opt-in)
+
+`/yolo classifier on` adds a third tier behind the regexes. Regexes only know the destructive shapes someone thought to write down — `find . -name '*.ts' -exec sed -i … {} +` is not one of them. When no rule matches, a model reads the command and can raise it to a confirmation.
+
+Two rules keep it honest:
+
+- **Escalation only.** It can turn `allow` into `ask`. It can never turn an `ask` or a `block` into an `allow`, so a classifier that gets talked into approving something cannot open the gate.
+- **A broken classifier changes nothing.** Timeout (20s), unreadable answer, no model available → the deterministic verdict stands. Safety comes from the rules; this is a second pair of eyes, not the gate.
+
+Obviously-safe commands (`git status`, `ls`, `cat`, `bun test`, …) skip the call entirely, so the cost lands only on unfamiliar ones.
+
+Measured over OpenRouter on six commands (three genuinely destructive, three read-only):
+
+| Model | Correct | Unreadable → no opinion |
+|---|---|---|
+| GPT-5.6 luna | 6/6 | 0 |
+| GPT-5.5 | 6/6 | 0 |
+| Claude Opus 4.8 | 6/6 | 0 |
+| GPT-5.6 terra / sol | 5/6 | 1 |
+| Claude Opus 5 | 4/6 | 1 |
+| Gemini 3.1 Pro | 2/6 | 4 |
+| Qwen3 235B | 3/6 | 3 |
+
+Every miss fell back to *allow* — no run ever downgraded a command the rules had already flagged. Weaker models simply give you less extra protection.
+
 ## Custom rules
 
 `.pi/yolo.json` — wildcard patterns, last-match-wins, may retune ASK/ALLOW but never the BLOCK floor:
@@ -65,6 +90,7 @@ Always on, in both modes:
 /yolo status     # mode, rule count, trail size
 /yolo trail      # recent trail entries
 /yolo undo 3     # restore the newest 3 file pre-images
+/yolo classifier on   # let a model flag unfamiliar commands (v0.3)
 ```
 
 ## License
