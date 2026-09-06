@@ -35,6 +35,12 @@ Credentials are the one thing no mode waves through — auto-approving speed is 
 
 A user rule opts a project out: `{ "pattern": "*/.env", "action": "allow" }`.
 
+## Trust and retention (v0.5)
+
+**`.pi/yolo.json` is only read in a trusted project.** A repository ships that file, and a user rule can *relax* the destructive tier — so a repo you just cloned could otherwise turn the guard down on its own say-so, silently, on the first command it runs. The file now rides pi's existing project-trust decision (`ctx.isProjectTrusted()`); until then `/yolo status` says the file was found and refused rather than pretending it does not exist. Global rules are unaffected.
+
+**The trail is kept 30 days.** Before this, nothing was ever deleted: every edit copied a whole file into the trail, and every checkpoint pinned a whole-tree stash commit under `refs/pify/yolo/*` — and git cannot reclaim an object a ref still points at, so the object store grew for the life of the machine. Pruning runs once per session and deletes the refs it releases.
+
 ## Checkpoints (v0.2)
 
 Before every risky bash command in a git repo, the trail records a `git stash create` checkpoint — a dangling commit holding the working tree exactly as it was, kept alive under `refs/pify/yolo/`. It writes nothing to your tree, index, or stash list. `/yolo trail` prints the recovery line next to the command:

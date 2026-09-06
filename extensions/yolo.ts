@@ -46,7 +46,16 @@ import {
   type Classification,
 } from "../src/classify.ts";
 import { evaluateCommand, evaluatePath, parseUserRules } from "../src/rules.ts";
-import { formatTrail, readManifest, recordBash, recordPreImage, trailDir, undo } from "../src/trail.ts";
+import {
+  DEFAULT_RETENTION_DAYS,
+  formatTrail,
+  pruneTrail,
+  readManifest,
+  recordBash,
+  recordPreImage,
+  trailDir,
+  undo,
+} from "../src/trail.ts";
 import {
   MODES,
   MODE_BADGES,
@@ -72,6 +81,8 @@ export default function yolo(pi: ExtensionAPI) {
   /** Opt-in: layer 3 costs a model call on unfamiliar commands. */
   let classifierEnabled = false;
   let userRules: UserRule[] = [];
+  /** A project shipped rules we did not load because the project is untrusted. */
+  let rulesRefused = false;
   let dir = "";
 
   function updateFooter(ctx: UiContext): void {
@@ -214,9 +225,41 @@ export default function yolo(pi: ExtensionAPI) {
     }
   }
 
-  function loadUserRules(cwd: string): void {
+  /**
+   * Delete the refs a prune released, so git can finally reclaim the commits
+   * they pinned. Best-effort: a ref that is already gone is the outcome we
+   * wanted anyway.
+   */
+  function releaseRefs(cwd: string, refs: string[]): void {
+    for (const ref of refs) {
+      try {
+        execFileSync("git", ["update-ref", "-d", ref], { cwd, timeout: 5000, windowsHide: true });
+      } catch {
+        // already gone, or not a repo any more
+      }
+    }
+  }
+
+  function loadUserRules(ctx: UiContext): void {
+    userRules = [];
+    rulesRefused = false;
+    let raw: string;
     try {
-      userRules = parseUserRules(JSON.parse(readFileSync(join(cwd, ".pi", "yolo.json"), "utf8")));
+      raw = readFileSync(join(ctx.cwd, ".pi", "yolo.json"), "utf8");
+    } catch {
+      return;
+    }
+    // A repository ships this file, and a user rule can RELAX the destructive
+    // tier — a cloned repo could otherwise turn the guard down on its own say
+    // so, silently, on the first command. pi already asks about project-local
+    // files; this rides that decision rather than inventing a second prompt.
+    const trusted = (ctx as unknown as { isProjectTrusted?: () => boolean }).isProjectTrusted?.() ?? false;
+    if (!trusted) {
+      rulesRefused = true;
+      return;
+    }
+    try {
+      userRules = parseUserRules(JSON.parse(raw));
     } catch {
       userRules = [];
     }
@@ -309,7 +352,11 @@ export default function yolo(pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     dir = trailDir(getAgentDir(), ctx.cwd);
-    loadUserRules(ctx.cwd);
+    loadUserRules(ctx);
+    // Retention runs once per session, not per command: the walk is cheap but
+    // it is still I/O in front of a tool call otherwise.
+    const pruned = pruneTrail(dir, Date.now());
+    if (pruned.refs.length > 0) releaseRefs(ctx.cwd, pruned.refs);
     mode = DEFAULT_MODE;
     classifierEnabled = false;
     for (const entry of ctx.sessionManager.getBranch()) {
@@ -376,7 +423,10 @@ export default function yolo(pi: ExtensionAPI) {
             [
               `Mode: ${MODE_LABELS[mode]}`,
               `Other modes: ${MODES.filter((m) => m !== mode).join(" · ")} (/yolo <mode>)`,
-              `User rules: ${userRules.length} (.pi/yolo.json)`,
+              rulesRefused
+                ? "User rules: .pi/yolo.json found but NOT loaded — this project is not trusted (rules can relax the guard)"
+                : `User rules: ${userRules.length} (.pi/yolo.json)`,
+              `Trail: kept ${DEFAULT_RETENTION_DAYS} days`,
               `AI classifier: ${classifierEnabled ? "on" : "off"} (/yolo classifier on)`,
               `Trail: ${entries.length} entries — /yolo trail to view, /yolo undo [n] to restore`,
             ].join("\n"),

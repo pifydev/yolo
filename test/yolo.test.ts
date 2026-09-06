@@ -24,7 +24,9 @@ import {
   wildcardToRegex,
 } from "../src/rules.ts";
 import {
+  checkpointRef,
   formatTrail,
+  pruneTrail,
   readManifest,
   recordBash,
   recordPreImage,
@@ -389,4 +391,64 @@ test("v0.4 every mode has a label, and only the default has no badge", () => {
   assert.equal(askTitle("strict", { action: "allow", rule: "default" }), "Strict mode — unrecognised command");
   assert.equal(askTitle("approve", { action: "ask", rule: "rm-rf" }), "Destructive command");
   assert.equal(askTitle("yolo", { action: "ask", rule: "secret:env-file" }), "Command touches secret material");
+});
+
+test("v0.5 prune drops what aged out and names the refs to release", () => {
+  const base = mkdtempSync(join(tmpdir(), "pify-yolo-prune-"));
+  const dir = join(base, "trail");
+  const now = Date.UTC(2026, 8, 6, 12, 0);
+  const day = 86_400_000;
+  try {
+    const old = join(base, "old.txt");
+    const fresh = join(base, "fresh.txt");
+    writeFileSync(old, "old");
+    writeFileSync(fresh, "fresh");
+
+    recordPreImage(dir, old, now - 40 * day);
+    recordBash(dir, "git reset --hard", base, "abc", now - 35 * day, "cafebabe");
+    recordPreImage(dir, fresh, now - 2 * day);
+    recordBash(dir, "rm -rf build", base, "def", now - 1 * day, "deadbeef");
+
+    const savedOld = readManifest(dir).find((e) => e.timestamp === now - 40 * day)!.saved!;
+    assert.ok(existsSync(join(dir, savedOld)), "the old pre-image starts on disk");
+
+    const result = pruneTrail(dir, now, 30);
+    assert.equal(result.entries, 2, "both entries older than 30 days");
+    assert.equal(result.files, 1, "one of them had a saved pre-image");
+    assert.deepEqual(result.refs, [checkpointRef(now - 35 * day)], "only checkpointed commands pin a ref");
+    assert.ok(!existsSync(join(dir, savedOld)), "the pre-image file is gone");
+
+    const kept = readManifest(dir);
+    assert.equal(kept.length, 2);
+    assert.ok(kept.every((e) => e.timestamp >= now - 30 * day));
+    // the recent checkpoint keeps its ref
+    assert.equal(kept.find((e) => e.type === "bash")!.stashSha, "deadbeef");
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("v0.5 prune is a no-op on a fresh or empty trail, and can be disabled", () => {
+  const base = mkdtempSync(join(tmpdir(), "pify-yolo-prune2-"));
+  const dir = join(base, "trail");
+  const now = Date.UTC(2026, 8, 6, 12, 0);
+  try {
+    assert.deepEqual(pruneTrail(dir, now, 30), { entries: 0, files: 0, refs: [] }, "empty trail");
+
+    recordBash(dir, "rm -rf x", base, null, now - 100 * 86_400_000, "old");
+    assert.deepEqual(pruneTrail(dir, now, 0), { entries: 0, files: 0, refs: [] }, "0 days disables it");
+    assert.equal(readManifest(dir).length, 1, "nothing was dropped");
+
+    const pruned = pruneTrail(dir, now, 30);
+    assert.equal(pruned.entries, 1);
+    assert.equal(readManifest(dir).length, 0);
+    // undo over an emptied trail still answers cleanly
+    assert.deepEqual(undo(dir, 5), { restored: [], deleted: [], skipped: [] });
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("v0.5 checkpointRef matches what the extension published", () => {
+  assert.equal(checkpointRef(1757160000000), "refs/pify/yolo/1757160000000");
 });

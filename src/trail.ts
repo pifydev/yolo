@@ -150,3 +150,67 @@ export function formatTrail(entries: TrailEntry[], limit: number): string {
     })
     .join("\n");
 }
+
+/**
+ * Retention. Nothing here was ever deleted: every edit copied a whole file
+ * into the trail and every risky command pinned a whole-tree stash commit
+ * under a ref, so a machine accumulated both for as long as it ran. Git can
+ * never reclaim an object a ref still points at, which makes the refs the
+ * worse half — pi-code's checkpoints made the same trade and answered it with
+ * a retention period, which is what this is.
+ */
+export const DEFAULT_RETENTION_DAYS = 30;
+
+export interface PruneResult {
+  /** Trail entries dropped from the manifest. */
+  entries: number;
+  /** Saved pre-image files deleted. */
+  files: number;
+  /** Checkpoint refs released, so gc can reclaim their commits. */
+  refs: string[];
+}
+
+/**
+ * Drop everything older than `days`. Returns what went, including the refs the
+ * caller must delete from the repository — this module never runs git.
+ */
+export function pruneTrail(dir: string, now: number, days = DEFAULT_RETENTION_DAYS): PruneResult {
+  const result: PruneResult = { entries: 0, files: 0, refs: [] };
+  if (days <= 0) return result;
+  const cutoff = now - days * 86_400_000;
+
+  const entries = readManifest(dir);
+  if (entries.length === 0) return result;
+  const kept: TrailEntry[] = [];
+  for (const entry of entries) {
+    if (entry.timestamp >= cutoff) {
+      kept.push(entry);
+      continue;
+    }
+    result.entries++;
+    if (entry.saved) {
+      try {
+        unlinkSync(join(dir, entry.saved));
+        result.files++;
+      } catch {
+        // already gone
+      }
+    }
+    if (entry.stashSha) result.refs.push(checkpointRef(entry.timestamp));
+  }
+  if (result.entries === 0) return result;
+
+  try {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(manifestPath(dir), kept.map((entry) => `${JSON.stringify(entry)}\n`).join(""));
+  } catch {
+    // an unwritable manifest leaves the trail as it was; nothing is lost
+    return { entries: 0, files: result.files, refs: result.refs };
+  }
+  return result;
+}
+
+/** The ref a checkpoint is published under, derived from its timestamp. */
+export function checkpointRef(timestamp: number): string {
+  return `refs/pify/yolo/${timestamp}`;
+}
