@@ -9,6 +9,14 @@ import {
   parseClassification,
 } from "../src/classify.ts";
 import {
+  MODES,
+  MODE_BADGES,
+  MODE_LABELS,
+  askTitle,
+  normalizeMode,
+  resolveAction,
+} from "../src/modes.ts";
+import {
   evaluateCommand,
   evaluatePath,
   parseUserRules,
@@ -319,4 +327,66 @@ test("v0.3 parseClassification reads prose answers, not just JSON", () => {
   );
   // still no opinion when there is genuinely none
   assert.equal(parseClassification("I am not sure what this does.").fallback, true);
+});
+
+test("v0.4 the two invariants hold in every mode", () => {
+  const catastrophic = evaluateCommand("rm -rf /");
+  const secret = evaluateCommand("cat .env");
+  for (const mode of MODES) {
+    assert.equal(
+      resolveAction({ mode, verdict: catastrophic, obviouslySafe: false }),
+      "block",
+      `catastrophic in ${mode}`,
+    );
+    assert.equal(resolveAction({ mode, verdict: secret, obviouslySafe: false }), "ask", `secret in ${mode}`);
+  }
+});
+
+test("v0.4 modes relax the destructive tier from strict to yolo", () => {
+  const destructive = evaluateCommand("rm -rf build");
+  assert.equal(destructive.action, "ask");
+  assert.equal(resolveAction({ mode: "yolo", verdict: destructive, obviouslySafe: false }), "allow");
+  assert.equal(resolveAction({ mode: "auto", verdict: destructive, obviouslySafe: false }), "allow");
+  assert.equal(resolveAction({ mode: "approve", verdict: destructive, obviouslySafe: false }), "ask");
+  assert.equal(resolveAction({ mode: "strict", verdict: destructive, obviouslySafe: false }), "ask");
+});
+
+test("v0.4 auto honours a rule you wrote by hand", () => {
+  const userAsk = evaluateCommand("npm run deploy", [{ pattern: "npm run deploy*", action: "ask" }]);
+  assert.equal(userAsk.rule, "user:npm run deploy*");
+  // auto relaxes the built-in tier but not an explicit instruction
+  assert.equal(resolveAction({ mode: "auto", verdict: userAsk, obviouslySafe: false }), "ask");
+  assert.equal(resolveAction({ mode: "yolo", verdict: userAsk, obviouslySafe: false }), "allow");
+});
+
+test("v0.4 strict asks about anything not plainly read-only", () => {
+  const plain = evaluateCommand("git status");
+  assert.equal(plain.action, "allow");
+  assert.equal(resolveAction({ mode: "strict", verdict: plain, obviouslySafe: true }), "allow");
+  const unknown = evaluateCommand("./deploy.sh");
+  assert.equal(unknown.action, "allow");
+  assert.equal(resolveAction({ mode: "strict", verdict: unknown, obviouslySafe: false }), "ask");
+  // the other modes leave allow alone
+  for (const mode of ["yolo", "auto", "approve"] as const) {
+    assert.equal(resolveAction({ mode, verdict: unknown, obviouslySafe: false }), "allow", mode);
+  }
+});
+
+test("v0.4 old sessions carrying \"guard\" reopen as approve", () => {
+  assert.equal(normalizeMode("guard"), "approve");
+  assert.equal(normalizeMode("yolo"), "yolo");
+  assert.equal(normalizeMode("strict"), "strict");
+  assert.equal(normalizeMode("nonsense"), null);
+  assert.equal(normalizeMode(undefined), null);
+});
+
+test("v0.4 every mode has a label, and only the default has no badge", () => {
+  for (const mode of MODES) {
+    assert.ok(MODE_LABELS[mode].length > 10, mode);
+  }
+  assert.equal(MODE_BADGES.approve, undefined);
+  assert.ok(MODE_BADGES.yolo && MODE_BADGES.auto && MODE_BADGES.strict);
+  assert.equal(askTitle("strict", { action: "allow", rule: "default" }), "Strict mode — unrecognised command");
+  assert.equal(askTitle("approve", { action: "ask", rule: "rm-rf" }), "Destructive command");
+  assert.equal(askTitle("yolo", { action: "ask", rule: "secret:env-file" }), "Command touches secret material");
 });

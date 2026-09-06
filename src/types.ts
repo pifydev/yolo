@@ -3,7 +3,8 @@
  * No imports from pi packages: src/ typechecks and runs standalone.
  */
 
-export type Mode = "guard" | "yolo";
+/** Four positions on the safety gradient; see src/modes.ts (v0.4). */
+export type Mode = "yolo" | "auto" | "approve" | "strict";
 
 export type RuleAction = "allow" | "ask" | "block";
 

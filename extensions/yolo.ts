@@ -1,11 +1,12 @@
 /**
  * @pify/yolo — one toggle to auto-approve everything, with an undo trail.
  *
- * Two modes. guard (default): bash runs through a three-tier safety gate —
- * catastrophic patterns BLOCK outright (never overridable), destructive
- * ones ASK with the command shown (denial reasons flow back to the agent),
- * everything else runs. yolo: the gate stands down and everything
- * auto-approves — but the trail keeps recording. In BOTH modes every
+ * A four-mode gradient (v0.4): yolo · auto · approve (default) · strict.
+ * Bash runs through a three-tier rule set — catastrophic patterns BLOCK,
+ * destructive ones ASK with the command shown (denial reasons flow back to
+ * the agent), everything else runs — and the mode decides how much of that
+ * to relax or tighten. Two invariants hold in every mode: the catastrophic
+ * floor blocks, and secret material asks. In EVERY mode
  * edit/write saves a pre-image first and risky bash commands are logged,
  * so /yolo undo can walk file changes back even after a restart.
  *
@@ -13,7 +14,7 @@
  * headless ASK becomes deny. User rules in .pi/yolo.json (wildcard,
  * last-match-wins) can retune ASK/ALLOW but never the catastrophic floor.
  *
- * v0.2 adds two things yolo mode deliberately does not stand down for:
+ * v0.2 adds two things no mode stands down for:
  * secret material (.env, ssh keys, cloud/registry credentials) asks before
  * any read/edit/write or naming command, and every risky bash command gets a
  * `git stash create` checkpoint recorded on the trail so command damage —
@@ -46,7 +47,18 @@ import {
 } from "../src/classify.ts";
 import { evaluateCommand, evaluatePath, parseUserRules } from "../src/rules.ts";
 import { formatTrail, readManifest, recordBash, recordPreImage, trailDir, undo } from "../src/trail.ts";
+import {
+  MODES,
+  MODE_BADGES,
+  MODE_LABELS,
+  askTitle,
+  normalizeMode,
+  resolveAction,
+} from "../src/modes.ts";
 import { isRecord, type Mode, type UserRule } from "../src/types.ts";
+
+/** Today's guard, under its new name. */
+const DEFAULT_MODE: Mode = "approve";
 
 const MODE_ENTRY = "yolo-mode";
 const CLASSIFIER_ENTRY = "yolo-classifier";
@@ -56,7 +68,7 @@ const CLASSIFY_TIMEOUT_MS = 20_000;
 type UiContext = ExtensionContext;
 
 export default function yolo(pi: ExtensionAPI) {
-  let mode: Mode = "guard";
+  let mode: Mode = DEFAULT_MODE;
   /** Opt-in: layer 3 costs a model call on unfamiliar commands. */
   let classifierEnabled = false;
   let userRules: UserRule[] = [];
@@ -64,7 +76,7 @@ export default function yolo(pi: ExtensionAPI) {
 
   function updateFooter(ctx: UiContext): void {
     if (!ctx.hasUI) return;
-    ctx.ui.setStatus("yolo", mode === "yolo" ? "⚡ YOLO" : undefined);
+    ctx.ui.setStatus("yolo", MODE_BADGES[mode]);
   }
 
   function setMode(ctx: UiContext, next: Mode): void {
@@ -73,9 +85,10 @@ export default function yolo(pi: ExtensionAPI) {
     updateFooter(ctx);
     if (ctx.hasUI) {
       ctx.ui.notify(
-        next === "yolo"
-          ? "⚡ YOLO on — everything auto-approves. The undo trail keeps recording; /yolo to turn the guard back on."
-          : "🛡 Guard on — catastrophic commands block, destructive ones ask.",
+        [
+          MODE_LABELS[next],
+          "Catastrophic commands block and secrets ask in every mode. The undo trail keeps recording.",
+        ].join("\n"),
         next === "yolo" ? "warning" : "info",
       );
     }
@@ -245,7 +258,14 @@ export default function yolo(pi: ExtensionAPI) {
       if (escalated.rule) verdict = { action: "ask", rule: escalated.rule };
     }
 
-    const touchesSecret = verdict.rule.startsWith("secret:");
+    // The mode decides what the verdict means: it may relax the destructive
+    // tier (auto/yolo) or tighten the allow tier (strict), but never touches
+    // the catastrophic floor or the secret gate.
+    const action = resolveAction({
+      mode,
+      verdict,
+      obviouslySafe: !needsClassification(command),
+    });
 
     // Log risky commands, with a checkpoint of the tree as it was.
     if (dir && verdict.action !== "allow") {
@@ -253,12 +273,9 @@ export default function yolo(pi: ExtensionAPI) {
       recordBash(dir, command, ctx.cwd, gitHead(ctx.cwd), now, gitCheckpoint(ctx.cwd, now));
     }
 
-    // The gate stands down in yolo mode — except for secrets.
-    if (mode === "yolo" && !touchesSecret) return undefined;
+    if (action === "allow") return undefined;
 
-    if (verdict.action === "allow") return undefined;
-
-    if (verdict.action === "block") {
+    if (action === "block") {
       return {
         block: true,
         reason: `yolo guard blocked this command (${verdict.rule}) — catastrophic patterns are never auto-approved. Do not retry it; choose a safer approach.`,
@@ -273,7 +290,7 @@ export default function yolo(pi: ExtensionAPI) {
       };
     }
     const approved = await ctx.ui.confirm(
-      touchesSecret ? "Command touches secret material" : "Destructive command",
+      askTitle(mode, verdict),
       `${command}\n\nRule: ${verdict.rule}. Run it?`,
     );
     if (approved) return undefined;
@@ -293,12 +310,13 @@ export default function yolo(pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     dir = trailDir(getAgentDir(), ctx.cwd);
     loadUserRules(ctx.cwd);
-    mode = "guard";
+    mode = DEFAULT_MODE;
     classifierEnabled = false;
     for (const entry of ctx.sessionManager.getBranch()) {
       const e = entry as { type?: string; customType?: string; data?: unknown };
       if (e.type === "custom" && e.customType === MODE_ENTRY && isRecord(e.data)) {
-        if (e.data.mode === "yolo" || e.data.mode === "guard") mode = e.data.mode;
+        const restored = normalizeMode(e.data.mode);
+        if (restored) mode = restored;
       }
       if (e.type === "custom" && e.customType === CLASSIFIER_ENTRY && isRecord(e.data)) {
         if (typeof e.data.enabled === "boolean") classifierEnabled = e.data.enabled;
@@ -308,12 +326,13 @@ export default function yolo(pi: ExtensionAPI) {
   });
 
   pi.on("session_tree", async (_event, ctx) => {
-    mode = "guard";
+    mode = DEFAULT_MODE;
     classifierEnabled = false;
     for (const entry of ctx.sessionManager.getBranch()) {
       const e = entry as { type?: string; customType?: string; data?: unknown };
       if (e.type === "custom" && e.customType === MODE_ENTRY && isRecord(e.data)) {
-        if (e.data.mode === "yolo" || e.data.mode === "guard") mode = e.data.mode;
+        const restored = normalizeMode(e.data.mode);
+        if (restored) mode = restored;
       }
       if (e.type === "custom" && e.customType === CLASSIFIER_ENTRY && isRecord(e.data)) {
         if (typeof e.data.enabled === "boolean") classifierEnabled = e.data.enabled;
@@ -329,25 +348,34 @@ export default function yolo(pi: ExtensionAPI) {
   // ── Command ──────────────────────────────────────────────────────────
 
   pi.registerCommand("yolo", {
-    description: "Toggle auto-approve: /yolo [on|off|status|trail|undo [n]|classifier on|off]",
+    description: "Safety gradient: /yolo [yolo|auto|approve|strict|status|trail|undo [n]|classifier on|off]",
     handler: async (args, ctx) => {
       const [route, countRaw] = (args ?? "").trim().toLowerCase().split(/\s+/);
       switch (route || "toggle") {
         case "toggle":
-          setMode(ctx, mode === "yolo" ? "guard" : "yolo");
+          // The bare command still flips between the two ends people use.
+          setMode(ctx, mode === "yolo" ? DEFAULT_MODE : "yolo");
           return;
         case "on":
           setMode(ctx, "yolo");
           return;
         case "off":
-          setMode(ctx, "guard");
+        case "guard":
+          setMode(ctx, DEFAULT_MODE);
+          return;
+        case "yolo":
+        case "auto":
+        case "approve":
+        case "strict":
+          setMode(ctx, route as Mode);
           return;
         case "status": {
           if (!ctx.hasUI) return;
           const entries = readManifest(dir);
           ctx.ui.notify(
             [
-              `Mode: ${mode === "yolo" ? "⚡ YOLO (gate off)" : "🛡 guard"}`,
+              `Mode: ${MODE_LABELS[mode]}`,
+              `Other modes: ${MODES.filter((m) => m !== mode).join(" · ")} (/yolo <mode>)`,
               `User rules: ${userRules.length} (.pi/yolo.json)`,
               `AI classifier: ${classifierEnabled ? "on" : "off"} (/yolo classifier on)`,
               `Trail: ${entries.length} entries — /yolo trail to view, /yolo undo [n] to restore`,

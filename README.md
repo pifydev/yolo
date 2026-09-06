@@ -1,26 +1,35 @@
 # @pify/yolo
 
-One toggle to auto-approve everything in [pi](https://github.com/earendil-works/pi) — with an undo trail so YOLO never means unrecoverable.
+A safety gradient for [pi](https://github.com/earendil-works/pi), from auto-approve-everything to ask-about-anything — with an undo trail so YOLO never means unrecoverable.
 
 Part of the [Pify suite](https://github.com/pifydev). Install with [`pify install yolo`](https://github.com/pifydev/cli) or `pi install npm:@pify/yolo`.
 
-## Two modes, one toggle
+## Four modes, one command (v0.4)
 
-**🛡 guard** (default) — every bash call runs through a three-tier gate:
+`/yolo <mode>` moves along a gradient. Two things hold in **every** mode, which is what makes the gradient safe to move along: catastrophic commands block, and secret material asks.
+
+| Mode | Catastrophic | Built-in destructive | Your `.pi/yolo.json` ask-rules | Everything else |
+|---|---|---|---|---|
+| `⚡ yolo` | blocked | runs | runs | runs |
+| `⚙ auto` | blocked | runs | asks | runs |
+| `🛡 approve` *(default)* | blocked | asks | asks | runs |
+| `🔒 strict` | blocked | asks | asks | asks unless plainly read-only |
+
+Bare `/yolo` still flips between `yolo` and `approve` — the two ends people actually toggle between. Sessions saved before v0.4 carried `guard`; that is what `approve` is now called, and they reopen there.
+
+**Behaviour change in v0.4**: `yolo` used to stand the *whole* gate down, catastrophic patterns included, which contradicted the rules' own claim that the floor is never overridable. The floor now holds in yolo mode too. If you were relying on `rm -rf /` auto-approving, you were relying on a bug.
 
 | Tier | Examples | Behavior |
 |---|---|---|
-| **BLOCK** | `rm -rf /`, `rm -rf ~`, `rm -rf .git`, `mkfs`, `dd of=/dev/…`, fork bomb, `> /dev/sda` | Refused outright. Never overridable — not even by user rules. |
+| **BLOCK** | `rm -rf /`, `rm -rf ~`, `rm -rf .git`, `mkfs`, `dd of=/dev/…`, fork bomb, `> /dev/sda` | Refused outright, in every mode. Never overridable — not by user rules, not by a mode. |
 | **ASK** | `rm -rf <path>`, `git push --force`, `git reset --hard`, `git clean -f`, `curl \| sh`, `find -delete`, `chmod 777`, history rewrites | Confirmation dialog with the command shown. Denials can carry your reason back to the agent. |
-| ALLOW | everything else | Runs untouched. |
-
-**⚡ yolo** (`/yolo`) — the gate stands down and everything auto-approves. The trail keeps recording.
+| ALLOW | everything else | Runs untouched (unless you are in `strict`). |
 
 Fail-closed everywhere: rule-evaluation errors block; ASK without a UI (headless/CI) denies.
 
 ## Secret files (v0.2)
 
-Credentials are the one thing yolo mode does **not** wave through — auto-approving speed is worth it, auto-approving your AWS keys into a prompt is not. Any `read`/`edit`/`write` on secret material, and any bash command that names it, asks first in both modes:
+Credentials are the one thing no mode waves through — auto-approving speed is worth it, auto-approving your AWS keys into a prompt is not. Any `read`/`edit`/`write` on secret material, and any bash command that names it, asks first in every mode:
 
 `.env` (and `.env.*`, but not `.env.example`/`.sample`/`.template`) · `~/.ssh/*` and `id_rsa`/`id_ed25519`-style keys (`.pub` halves are fine) · `.aws/credentials` · `.pi/agent/auth.json`, `.claude/.credentials.json` · `.npmrc`, `.pypirc`, `.netrc`, `.git-credentials` · `~/.config/gh/hosts.yml` · `*.pem`, `*.key`, `*.p12`, `*.pfx` · `secrets.json`/`credentials.yaml`
 
@@ -39,7 +48,7 @@ That covers what `/yolo undo` can't: damage done by a command rather than by an 
 
 ## The undo trail
 
-Always on, in both modes:
+Always on, in every mode:
 
 - Every `edit`/`write` saves the file's **pre-image** first (per-project trail under the agent dir — survives restarts).
 - Risky bash commands are logged with cwd, timestamp, and git HEAD.
@@ -86,8 +95,9 @@ Every miss fell back to *allow* — no run ever downgraded a command the rules h
 ## Commands
 
 ```
-/yolo            # toggle guard ↔ yolo
-/yolo status     # mode, rule count, trail size
+/yolo            # flip between yolo and approve
+/yolo strict     # or: yolo | auto | approve | strict (v0.4)
+/yolo status     # mode, the other modes, rule count, trail size
 /yolo trail      # recent trail entries
 /yolo undo 3     # restore the newest 3 file pre-images
 /yolo classifier on   # let a model flag unfamiliar commands (v0.3)
