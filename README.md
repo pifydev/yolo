@@ -4,7 +4,15 @@ A safety gradient for [pi](https://github.com/earendil-works/pi), from auto-appr
 
 Part of the [Pify suite](https://github.com/pifydev). Install with [`pify install yolo`](https://github.com/pifydev/cli) or `pi install npm:@pify/yolo`.
 
-## Four modes, one command (v0.4)
+## Why
+
+Approving every command is exhausting and you stop reading them; approving none of them means an agent that cannot work. Both ends are wrong, and which end you want changes several times a day — scaffolding a prototype is not the same as touching production config.
+
+So this is a gradient rather than a switch, with two properties that hold at *every* setting: catastrophic commands are refused outright, and anything touching credentials asks. Those two make the rest safe to slide.
+
+The second half is the undo trail. A guard that only says no is a guard you turn off; a guard that lets you take the risk *and* take it back is one you can live with.
+
+## Four modes, one command
 
 `/yolo <mode>` moves along a gradient. Two things hold in **every** mode, which is what makes the gradient safe to move along: catastrophic commands block, and secret material asks.
 
@@ -15,9 +23,9 @@ Part of the [Pify suite](https://github.com/pifydev). Install with [`pify instal
 | `🛡 approve` *(default)* | blocked | asks | asks | runs |
 | `🔒 strict` | blocked | asks | asks | asks unless plainly read-only |
 
-Bare `/yolo` still flips between `yolo` and `approve` — the two ends people actually toggle between. Sessions saved before v0.4 carried `guard`; that is what `approve` is now called, and they reopen there.
+Bare `/yolo` still flips between `yolo` and `approve` — the two ends people actually toggle between. Sessions saved before the gradient existed carried `guard`; that is what `approve` is now called, and they reopen there.
 
-**Behaviour change in v0.4**: `yolo` used to stand the *whole* gate down, catastrophic patterns included, which contradicted the rules' own claim that the floor is never overridable. The floor now holds in yolo mode too. If you were relying on `rm -rf /` auto-approving, you were relying on a bug.
+**A behaviour change worth knowing about**: `yolo` used to stand the *whole* gate down, catastrophic patterns included, which contradicted the rules' own claim that the floor is never overridable. The floor now holds in yolo mode too. If you were relying on `rm -rf /` auto-approving, you were relying on a bug.
 
 | Tier | Examples | Behavior |
 |---|---|---|
@@ -27,7 +35,7 @@ Bare `/yolo` still flips between `yolo` and `approve` — the two ends people ac
 
 Fail-closed everywhere: rule-evaluation errors block; ASK without a UI (headless/CI) denies.
 
-## Secret files (v0.2)
+## Secret files
 
 Credentials are the one thing no mode waves through — auto-approving speed is worth it, auto-approving your AWS keys into a prompt is not. Any `read`/`edit`/`write` on secret material, and any bash command that names it, asks first in every mode:
 
@@ -35,13 +43,13 @@ Credentials are the one thing no mode waves through — auto-approving speed is 
 
 A user rule opts a project out: `{ "pattern": "*/.env", "action": "allow" }`.
 
-## Trust and retention (v0.5)
+## Trust and retention
 
 **`.pi/yolo.json` is only read in a trusted project.** A repository ships that file, and a user rule can *relax* the destructive tier — so a repo you just cloned could otherwise turn the guard down on its own say-so, silently, on the first command it runs. The file now rides pi's existing project-trust decision (`ctx.isProjectTrusted()`); until then `/yolo status` says the file was found and refused rather than pretending it does not exist. Global rules are unaffected.
 
 **The trail is kept 30 days.** Before this, nothing was ever deleted: every edit copied a whole file into the trail, and every checkpoint pinned a whole-tree stash commit under `refs/pify/yolo/*` — and git cannot reclaim an object a ref still points at, so the object store grew for the life of the machine. Pruning runs once per session and deletes the refs it releases.
 
-## Checkpoints (v0.2)
+## Checkpoints
 
 Before every risky bash command in a git repo, the trail records a `git stash create` checkpoint — a dangling commit holding the working tree exactly as it was, kept alive under `refs/pify/yolo/`. It writes nothing to your tree, index, or stash list. `/yolo trail` prints the recovery line next to the command:
 
@@ -60,7 +68,7 @@ Always on, in every mode:
 - Risky bash commands are logged with cwd, timestamp, and git HEAD.
 - `/yolo trail` shows history; `/yolo undo [n]` restores the newest n file changes (with a confirmation listing exactly what will be touched). Files that didn't exist before are deleted; bash effects are logged but not undoable.
 
-## AI classifier (v0.3, opt-in)
+## AI classifier (opt-in)
 
 `/yolo classifier on` adds a third tier behind the regexes. Regexes only know the destructive shapes someone thought to write down — `find . -name '*.ts' -exec sed -i … {} +` is not one of them. When no rule matches, a model reads the command and can raise it to a confirmation.
 
@@ -102,11 +110,11 @@ Every miss fell back to *allow* — no run ever downgraded a command the rules h
 
 ```
 /yolo            # flip between yolo and approve
-/yolo strict     # or: yolo | auto | approve | strict (v0.4)
+/yolo strict     # or: yolo | auto | approve | strict
 /yolo status     # mode, the other modes, rule count, trail size
 /yolo trail      # recent trail entries
 /yolo undo 3     # restore the newest 3 file pre-images
-/yolo classifier on   # let a model flag unfamiliar commands (v0.3)
+/yolo classifier on   # let a model flag unfamiliar commands
 ```
 
 ## License
