@@ -45,7 +45,11 @@ A user rule opts a project out: `{ "pattern": "*/.env", "action": "allow" }`.
 
 ## Trust and retention
 
-**`.pi/yolo.json` is only read in a trusted project.** A repository ships that file, and a user rule can *relax* the destructive tier — so a repo you just cloned could otherwise turn the guard down on its own say-so, silently, on the first command it runs. The file now rides pi's existing project-trust decision (`ctx.isProjectTrusted()`); until then `/yolo status` says the file was found and refused rather than pretending it does not exist. Global rules are unaffected.
+**`.pi/yolo.json` is only read once you have approved it.** A repository ships that file, and a user rule can *relax* the destructive tier — so a repo you just cloned could otherwise turn the guard down on its own say-so, silently, on the first command it runs.
+
+pi's own project trust is necessary but not sufficient here. pi asks about trust only when the repository ships one of the resources **pi itself** loads — `.pi/settings.json`, `.pi/extensions`, `.pi/skills`, `.pi/prompts`, `.pi/themes`, `SYSTEM.md`, `APPEND_SYSTEM.md`. A repo carrying only `.pi/yolo.json` triggers no prompt, and `isProjectTrusted()` then returns true by default — measured, not assumed. So the question is this extension's to ask: once per project, remembered afterwards, refused outright in a headless run with no answer on record, and never able to override a project pi itself refused. `/yolo status` says the file was found and refused rather than pretending it does not exist. Global rules are unaffected.
+
+For CI, set `PIFY_TRUST_PROJECT=1` — an environment variable, because the repository being read cannot set one for itself.
 
 **The trail is kept 30 days.** Before this, nothing was ever deleted: every edit copied a whole file into the trail, and every checkpoint pinned a whole-tree stash commit under `refs/pify/yolo/*` — and git cannot reclaim an object a ref still points at, so the object store grew for the life of the machine. Pruning runs once per session and deletes the refs it releases.
 

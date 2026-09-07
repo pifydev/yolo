@@ -34,7 +34,7 @@ import {
   type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { execFileSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import {
@@ -46,6 +46,14 @@ import {
   type Classification,
 } from "../src/classify.ts";
 import { evaluateCommand, evaluatePath, parseUserRules } from "../src/rules.ts";
+import {
+  consentQuestion,
+  decideConsent,
+  envConsent,
+  parseConsent,
+  readConsent,
+  writeConsent,
+} from "../src/consent.ts";
 import {
   DEFAULT_RETENTION_DAYS,
   formatTrail,
@@ -240,7 +248,7 @@ export default function yolo(pi: ExtensionAPI) {
     }
   }
 
-  function loadUserRules(ctx: UiContext): void {
+  async function loadUserRules(ctx: UiContext): Promise<void> {
     userRules = [];
     rulesRefused = false;
     let raw: string;
@@ -251,10 +259,14 @@ export default function yolo(pi: ExtensionAPI) {
     }
     // A repository ships this file, and a user rule can RELAX the destructive
     // tier — a cloned repo could otherwise turn the guard down on its own say
-    // so, silently, on the first command. pi already asks about project-local
-    // files; this rides that decision rather than inventing a second prompt.
-    const trusted = (ctx as unknown as { isProjectTrusted?: () => boolean }).isProjectTrusted?.() ?? false;
-    if (!trusted) {
+    // so, silently, on the first command.
+    //
+    // pi's own trust decision is necessary but not sufficient: pi only asks
+    // about trust when the repository ships one of the resources pi itself
+    // loads, and `.pi/yolo.json` is not one of them. Measured, a repo whose
+    // only pi file was an extension's own config reported
+    // `isProjectTrusted=true` — so the question has to be ours to put.
+    if (!(await projectRulesAllowed(ctx))) {
       rulesRefused = true;
       return;
     }
@@ -263,6 +275,43 @@ export default function yolo(pi: ExtensionAPI) {
     } catch {
       userRules = [];
     }
+  }
+
+  /** Where the suite records which projects you approved, and for what. */
+  function consentFile(): string {
+    return join(getAgentDir(), "pify-project-consent.json");
+  }
+
+  /** May this repository's own gate rules be loaded? */
+  async function projectRulesAllowed(ctx: UiContext): Promise<boolean> {
+    const path = join(ctx.cwd, ".pi", "yolo.json");
+    const file = consentFile();
+    let raw: string | null = null;
+    try {
+      raw = readFileSync(file, "utf8");
+    } catch {
+      raw = null;
+    }
+    const store = parseConsent(raw);
+    const verdict = decideConsent({
+      projectTrusted: (ctx as unknown as { isProjectTrusted?: () => boolean }).isProjectTrusted?.() ?? false,
+      remembered: readConsent(store, ctx.cwd, "yolo"),
+      hasUI: ctx.hasUI,
+      envOverride: envConsent(process.env),
+    });
+    if (verdict !== "ask") return verdict === "allow";
+
+    const approved = await ctx.ui.confirm(
+      "Load this project's command rules?",
+      consentQuestion("its own rules for the command gate, which can relax what gets confirmed", path),
+    );
+    try {
+      writeFileSync(file, `${JSON.stringify(writeConsent(store, ctx.cwd, "yolo", approved), null, 2)}
+`);
+    } catch {
+      // An unwritable consent file costs us the memory of the answer, not the answer.
+    }
+    return approved;
   }
 
   // ── The gate + the trail ─────────────────────────────────────────────
@@ -352,7 +401,7 @@ export default function yolo(pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     dir = trailDir(getAgentDir(), ctx.cwd);
-    loadUserRules(ctx);
+    await loadUserRules(ctx);
     // Retention runs once per session, not per command: the walk is cheap but
     // it is still I/O in front of a tool call otherwise.
     const pruned = pruneTrail(dir, Date.now());
