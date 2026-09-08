@@ -35,6 +35,24 @@ Bare `/yolo` still flips between `yolo` and `approve` — the two ends people ac
 
 Fail-closed everywhere: rule-evaluation errors block; ASK without a UI (headless/CI) denies.
 
+## Writing a file nobody looked at
+
+pi's `write` tool replaces a file whole, with no requirement that anyone ever read it. `edit` matches its `oldString` against what is on disk, which proves the string is there and nothing about whether the agent knew what else was. So two shapes get through upstream, and both destroy work:
+
+- a whole-file `write` to a file this session never read — everything in it the agent did not know about is gone;
+- an edit to a file that changed on disk *after* it was read, by a formatter, a rebase, or another tool — the agent is editing against a picture that is no longer true.
+
+In `approve` and `strict` these ask, with the file named and the reason spelled out. In `yolo` and `auto` they run, like every other risk on the gradient. Creating a new file is never blind and never asks, and a file the agent wrote itself counts as read — otherwise writing a file and immediately editing it would be refused for not having read something the agent had just authored.
+
+The answer to a refusal is always available: reads are cheap, and the agent is told to take one.
+
+| Mode | Blind write / stale edit |
+|---|---|
+| `⚡ yolo` | runs |
+| `⚙ auto` | runs |
+| `🛡 approve` *(default)* | asks |
+| `🔒 strict` | asks |
+
 ## Secret files
 
 Credentials are the one thing no mode waves through — auto-approving speed is worth it, auto-approving your AWS keys into a prompt is not. Any `read`/`edit`/`write` on secret material, and any bash command that names it, asks first in every mode:

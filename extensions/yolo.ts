@@ -34,7 +34,7 @@ import {
   type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { execFileSync } from "node:child_process";
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import {
@@ -46,6 +46,7 @@ import {
   type Classification,
 } from "../src/classify.ts";
 import { evaluateCommand, evaluatePath, parseUserRules } from "../src/rules.ts";
+import { ReadLedger, assessBlindWrite, blindTitle } from "../src/reads.ts";
 import {
   consentQuestion,
   decideConsent,
@@ -154,6 +155,62 @@ export default function yolo(pi: ExtensionAPI) {
     } catch {
       return null;
     }
+  }
+
+  /**
+   * What this session has read, and what the file looked like at the time.
+   * Per session by design: a read from an hour ago in a different session is
+   * not knowledge this agent has.
+   */
+  const reads = new ReadLedger();
+
+  function statOf(path: string): { size: number; mtimeMs: number } | null {
+    try {
+      const s = statSync(path);
+      return s.isFile() ? { size: s.size, mtimeMs: s.mtimeMs } : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Refuse to write a file blind. pi's `write` replaces a file whole with no
+   * requirement that anyone read it, and `edit` proves only that its
+   * oldString is present — not that the agent knew what else was.
+   *
+   * It follows the mode gradient like every other risk here: the two fast
+   * modes run, the two careful ones ask. Reads are cheap, so the answer to a
+   * refusal is always available to the agent.
+   */
+  async function guardBlindWrite(
+    ctx: UiContext,
+    tool: "write" | "edit",
+    path: string,
+  ): Promise<{ block: true; reason: string } | undefined> {
+    if (mode === "yolo" || mode === "auto") return undefined;
+
+    const verdict = assessBlindWrite(tool, path, statOf(path), reads);
+    if (verdict.ok) return undefined;
+
+    if (!ctx.hasUI) {
+      return {
+        block: true,
+        reason: `yolo guard: ${verdict.reason} No UI to confirm (fail-closed deny). Read the file first.`,
+      };
+    }
+    const approved = await ctx.ui.confirm(blindTitle(verdict.kind), `${verdict.reason}
+
+Go ahead anyway?`);
+    if (approved) {
+      // Approving it means the user has taken responsibility for this file;
+      // asking again on the next edit would be nagging, not guarding.
+      reads.note(path, statOf(path) ?? { size: 0, mtimeMs: 0 });
+      return undefined;
+    }
+    return {
+      block: true,
+      reason: `The user declined. ${verdict.reason} Read the file, then try again.`,
+    };
   }
 
   /** Confirmation gate for a file path (secret material). */
@@ -327,8 +384,20 @@ export default function yolo(pi: ExtensionAPI) {
           const denial = await guardPath(ctx, path, verdict.rule, verdict.action);
           if (denial) return denial;
         }
-        // Trail: pre-image every file mutation, in both modes.
-        if (event.toolName !== "read" && dir) recordPreImage(dir, path, Date.now());
+        if (event.toolName === "read") {
+          // Record what the read is about to see, so a later edit can tell
+          // whether the file still looks like that.
+          const seen = statOf(path);
+          if (seen) reads.note(path, seen);
+        } else {
+          const denial = await guardBlindWrite(ctx, event.toolName, path);
+          if (denial) return denial;
+          // A write that creates a file means the agent authored its
+          // contents, so an immediate follow-up edit is not blind.
+          if (event.toolName === "write" && statOf(path) === null) reads.note(path, { size: 0, mtimeMs: 0 });
+          // Trail: pre-image every file mutation, in every mode.
+          if (dir) recordPreImage(dir, path, Date.now());
+        }
       }
       return undefined;
     }
@@ -398,6 +467,19 @@ export default function yolo(pi: ExtensionAPI) {
   });
 
   // ── Lifecycle ────────────────────────────────────────────────────────
+
+  pi.on("tool_result", async (event) => {
+    // The agent wrote this content, so it knows what is in the file now.
+    // Without this, its own write would make the next edit look stale.
+    const name = (event as { toolName?: string }).toolName;
+    if (name !== "write" && name !== "edit") return;
+    // A tool that failed changed nothing, so it taught the agent nothing.
+    if ((event as { isError?: boolean }).isError === true) return;
+    const path = (event as { input?: Record<string, unknown> }).input?.path;
+    if (typeof path !== "string") return;
+    const now = statOf(path);
+    if (now) reads.note(path, now);
+  });
 
   pi.on("session_start", async (_event, ctx) => {
     dir = trailDir(getAgentDir(), ctx.cwd);
