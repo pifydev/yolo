@@ -22,8 +22,8 @@ export interface UserRule {
 export interface TrailEntry {
   seq: number;
   timestamp: number;
-  type: "file" | "bash";
-  /** file: absolute path edited/written. bash: the command. */
+  type: "file" | "bash" | "prompt";
+  /** file: absolute path edited/written. bash: the command. prompt: what you typed. */
   target: string;
   /** file: saved pre-image filename (null when the file did not exist). */
   saved: string | null;
@@ -31,8 +31,10 @@ export interface TrailEntry {
   existed: boolean;
   cwd?: string;
   gitHead?: string;
-  /** bash: dangling `git stash create` commit holding the pre-command tree. */
+  /** bash/prompt: dangling `git stash create` commit holding the tree as it stood. */
   stashSha?: string;
+  /** prompt: the session entry the message became, for conversation rewind. */
+  entryId?: string;
 }
 
 export interface BranchEntryLike {

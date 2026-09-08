@@ -48,6 +48,16 @@ import {
 import { evaluateCommand, evaluatePath, parseUserRules } from "../src/rules.ts";
 import { ReadLedger, assessBlindWrite, blindTitle } from "../src/reads.ts";
 import {
+  RESTORE_LABELS,
+  clipPrompt,
+  formatRewindList,
+  parseRewindArgs,
+  restoreChoices,
+  restoreSummary,
+  rewindPoints,
+  type RestoreChoice,
+} from "../src/rewind.ts";
+import {
   consentQuestion,
   decideConsent,
   envConsent,
@@ -62,6 +72,7 @@ import {
   readManifest,
   recordBash,
   recordPreImage,
+  recordPrompt,
   trailDir,
   undo,
 } from "../src/trail.ts";
@@ -468,6 +479,33 @@ Go ahead anyway?`);
 
   // ── Lifecycle ────────────────────────────────────────────────────────
 
+  /**
+   * A checkpoint per prompt. The trail's own unit is the file change, which is
+   * right for the gate and wrong for a person — nobody counts writes, they
+   * think "forget I asked that".
+   *
+   * The prompt text comes from `before_agent_start`, which carries it; the
+   * session entry id comes from the leaf at `agent_start`, once the message
+   * has actually been appended. Reading the branch instead looked simpler and
+   * was wrong: at `before_agent_start` the user message is not in it yet.
+   */
+  let pendingPrompt: string | null = null;
+
+  pi.on("before_agent_start", async (event) => {
+    const prompt = (event as { prompt?: unknown }).prompt;
+    pendingPrompt = typeof prompt === "string" ? clipPrompt(prompt) : null;
+    return undefined;
+  });
+
+  pi.on("agent_start", async (_event, ctx) => {
+    const prompt = pendingPrompt;
+    pendingPrompt = null;
+    if (!dir || !prompt) return;
+    const leaf = ctx.sessionManager.getLeafId?.() ?? null;
+    const now = Date.now();
+    recordPrompt(dir, prompt, leaf, ctx.cwd, gitHead(ctx.cwd), now, gitCheckpoint(ctx.cwd, now));
+  });
+
   pi.on("tool_result", async (event) => {
     // The agent wrote this content, so it knows what is in the file now.
     // Without this, its own write would make the next edit look stale.
@@ -526,7 +564,8 @@ Go ahead anyway?`);
   // ── Command ──────────────────────────────────────────────────────────
 
   pi.registerCommand("yolo", {
-    description: "Safety gradient: /yolo [yolo|auto|approve|strict|status|trail|undo [n]|classifier on|off]",
+    description:
+      "Safety gradient: /yolo [yolo|auto|approve|strict|status|trail|rewind [n]|undo [n]|classifier on|off]",
     handler: async (args, ctx) => {
       const [route, countRaw] = (args ?? "").trim().toLowerCase().split(/\s+/);
       switch (route || "toggle") {
@@ -589,6 +628,77 @@ Go ahead anyway?`);
                 : "AI classifier OFF.",
               "info",
             );
+          }
+          return;
+        }
+        case "rewind": {
+          if (!ctx.hasUI) return;
+          const parsed = parseRewindArgs((args ?? "").trim().slice("rewind".length));
+          if (parsed.kind === "error") {
+            ctx.ui.notify(parsed.message, "warning");
+            return;
+          }
+          const points = rewindPoints(readManifest(dir));
+          if (parsed.kind === "list") {
+            ctx.ui.notify(formatRewindList(points, 15), "info");
+            return;
+          }
+          const point = points[parsed.index - 1];
+          if (!point) {
+            ctx.ui.notify(`No checkpoint ${parsed.index}. /yolo rewind lists them.`, "warning");
+            return;
+          }
+          const choices = restoreChoices(point);
+          if (choices.length === 0) {
+            ctx.ui.notify(
+              "That prompt has nothing to restore — the tree was unchanged and the message left no session entry.",
+              "warning",
+            );
+            return;
+          }
+          const labels = choices.map((c) => RESTORE_LABELS[c]);
+          const picked = await ctx.ui.select("Rewind what?", labels);
+          if (picked === undefined) return;
+          const choice = choices[labels.indexOf(picked)] as RestoreChoice;
+
+          if (!(await ctx.ui.confirm("Rewind", restoreSummary(point, choice)))) return;
+
+          if (choice === "code" || choice === "both") {
+            // `git checkout <stash-sha> -- .` writes that tree over the working
+            // directory without moving HEAD or touching the branch, which is
+            // what "put the files back" has to mean here.
+            try {
+              execFileSync("git", ["checkout", point.stashSha as string, "--", "."], {
+                cwd: ctx.cwd,
+                timeout: 30_000,
+                windowsHide: true,
+              });
+              ctx.ui.notify(`Working tree restored to ${point.stashSha?.slice(0, 8)}.`, "info");
+            } catch (err) {
+              ctx.ui.notify(
+                `Could not restore the tree: ${err instanceof Error ? err.message : String(err)}`,
+                "error",
+              );
+              return;
+            }
+          }
+
+          if (choice === "conversation" || choice === "both") {
+            const host = ctx as unknown as {
+              navigateTree?: (id: string, options?: { label?: string }) => Promise<{ cancelled: boolean }>;
+            };
+            if (typeof host.navigateTree !== "function") {
+              ctx.ui.notify("This pi build cannot navigate the session tree.", "warning");
+              return;
+            }
+            try {
+              await host.navigateTree(point.entryId as string, { label: "before: " + point.prompt.slice(0, 40) });
+            } catch (err) {
+              ctx.ui.notify(
+                `Could not move the conversation: ${err instanceof Error ? err.message : String(err)}`,
+                "error",
+              );
+            }
           }
           return;
         }

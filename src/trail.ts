@@ -99,6 +99,38 @@ export function recordBash(
   }
 }
 
+/**
+ * Checkpoint a prompt. Same manifest as everything else, so retention and
+ * pruning stay one story rather than two — a prompt entry's stash ref is
+ * released by the same pass that releases a command's.
+ */
+export function recordPrompt(
+  dir: string,
+  prompt: string,
+  entryId: string | null,
+  cwd: string,
+  gitHead: string | null,
+  now: number,
+  stashSha: string | null = null,
+): void {
+  try {
+    append(dir, {
+      seq: nextSeq(dir),
+      timestamp: now,
+      type: "prompt",
+      target: prompt,
+      saved: null,
+      existed: false,
+      cwd,
+      ...(gitHead ? { gitHead } : {}),
+      ...(stashSha ? { stashSha } : {}),
+      ...(entryId ? { entryId } : {}),
+    });
+  } catch {
+    // the trail must never break a turn
+  }
+}
+
 export interface UndoResult {
   restored: string[];
   deleted: string[];
@@ -143,6 +175,9 @@ export function formatTrail(entries: TrailEntry[], limit: number): string {
       const when = new Date(e.timestamp).toISOString().replace("T", " ").slice(0, 19);
       if (e.type === "file") {
         return `#${e.seq} ${when} file  ${e.target}${e.existed ? "" : " (new file)"}`;
+      }
+      if (e.type === "prompt") {
+        return `#${e.seq} ${when} you   ${e.target}`;
       }
       const head = e.gitHead ? ` @${e.gitHead.slice(0, 8)}` : "";
       const stash = e.stashSha ? `\n    ↩ git stash apply ${e.stashSha}` : "";

@@ -90,6 +90,27 @@ Always on, in every mode:
 - Risky bash commands are logged with cwd, timestamp, and git HEAD.
 - `/yolo trail` shows history; `/yolo undo [n]` restores the newest n file changes (with a confirmation listing exactly what will be touched). Files that didn't exist before are deleted; bash effects are logged but not undoable.
 
+## Rewind to before you asked
+
+The trail's unit is the file change, and `/yolo undo 3` walks back three of them. That is right for the gate and wrong for a person: nobody thinks "undo the last four writes", they think *forget I asked that*. A turn is a dozen trail entries, and counting them is work you should not be doing.
+
+So every prompt gets a checkpoint of its own — the working tree as it stood when you hit enter, and the session entry your message became:
+
+```
+/yolo rewind            # list the checkpoints, newest first
+/yolo rewind 3          # go back to the third one
+```
+
+Picking one asks what to restore, offering only what that checkpoint can actually deliver:
+
+- **the working tree only** — the files go back, the conversation stays;
+- **the conversation only** — the session moves to just before that message, the files stay;
+- **both**.
+
+A prompt sent with a clean tree has no stash to return to, so it does not offer one; a prompt whose message left no session entry does not offer the conversation. The confirmation says which of those you are about to do and what it costs — a tree restore overwrites anything written since and uncommitted work is not recoverable afterwards, while moving the conversation deletes nothing, because the later turns stay reachable in the session tree.
+
+Checkpoints live on the same trail as everything else, so they inherit the same 30-day retention and the same ref cleanup.
+
 ## AI classifier (opt-in)
 
 `/yolo classifier on` adds a third tier behind the regexes. Regexes only know the destructive shapes someone thought to write down — `find . -name '*.ts' -exec sed -i … {} +` is not one of them. When no rule matches, a model reads the command and can raise it to a confirmation.
@@ -135,6 +156,7 @@ Every miss fell back to *allow* — no run ever downgraded a command the rules h
 /yolo strict     # or: yolo | auto | approve | strict
 /yolo status     # mode, the other modes, rule count, trail size
 /yolo trail      # recent trail entries
+/yolo rewind     # list prompt checkpoints; /yolo rewind <n> to go back
 /yolo undo 3     # restore the newest 3 file pre-images
 /yolo classifier on   # let a model flag unfamiliar commands
 ```
