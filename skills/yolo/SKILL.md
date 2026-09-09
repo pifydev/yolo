@@ -1,6 +1,6 @@
 ---
 name: yolo
-description: Use when a bash command gets blocked or needs confirmation by the yolo guard, or when the user asks about undoing recent changes - explains the guard tiers, how to respond to denials, and the undo trail
+description: Use when a bash command gets blocked or needs confirmation by the yolo guard, or when the user asks about undoing recent changes
 ---
 
 # YOLO guard & undo trail
