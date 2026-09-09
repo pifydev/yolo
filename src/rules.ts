@@ -1,4 +1,5 @@
 import type { RuleAction, RuleHit, UserRule } from "./types.ts";
+import { opacityOf, unwrapCommand } from "./unwrap.ts";
 
 /**
  * Three-tier bash safety rules (pi-yolo-seatbelt's model):
@@ -28,8 +29,8 @@ const CATASTROPHIC: BuiltinRule[] = [
 
 /** Destructive — confirmation required in guard mode; user rules may retune. */
 const DESTRUCTIVE: BuiltinRule[] = [
-  { name: "rm-rf", action: "ask", re: /\brm\s+-\w*([rR]\w*[fF]|[fF]\w*[rR])\w*\s/ },
-  { name: "rm-r", action: "ask", re: /\brm\s+-\w*[rR]\w*\s/ },
+  { name: "rm-rf", action: "ask", re: /\brm\s+-\w*([rR]\w*[fF]|[fF]\w*[rR])\w*(\s|$)/ },
+  { name: "rm-r", action: "ask", re: /\brm\s+-\w*[rR]\w*(\s|$)/ },
   { name: "git-push-force", action: "ask", re: /\bgit\s+push\b[^|;&]*(\s--force(-with-lease)?\b|\s-f\b)/ },
   { name: "git-reset-hard", action: "ask", re: /\bgit\s+reset\s+--hard\b/ },
   { name: "git-clean-force", action: "ask", re: /\bgit\s+clean\b[^|;&]*\s-\w*[fdx]/ },
@@ -37,6 +38,13 @@ const DESTRUCTIVE: BuiltinRule[] = [
   { name: "git-discard", action: "ask", re: /\bgit\s+(checkout|restore)\s+(--\s+)?\.(\s|$)/ },
   { name: "pipe-to-shell", action: "ask", re: /\b(curl|wget)\b[^|;&]*\|\s*(sudo\s+)?(ba|z|fi)?sh\b/ },
   { name: "find-delete", action: "ask", re: /\bfind\b[^|;&]*\s-delete\b/ },
+  // `-exec rm {} +` deletes every match. Unwrapping exposes only the bare
+  // `rm`, which is not itself flagged — the danger is in the pairing.
+  {
+    name: "find-exec-mutating",
+    action: "ask",
+    re: /\bfind\b[^|;&]*\s-exec(dir)?\s+(sudo\s+)?(rm|mv|cp|chmod|chown|truncate|dd|tee|sh|bash|zsh)\b/,
+  },
   { name: "chmod-777", action: "ask", re: /\bchmod\s+(-\w+\s+)*777\b/ },
   { name: "truncate", action: "ask", re: /\btruncate\s+-s\s*0\b/ },
   { name: "history-rewrite", action: "ask", re: /\bgit\s+(rebase|filter-branch|filter-repo)\b/ },
@@ -125,22 +133,38 @@ export function evaluateCommand(command: string, userRules: UserRule[] = []): Ru
     const normalized = normalize(command);
     if (!normalized) return { action: "allow", rule: "empty" };
 
-    // Hard floor: catastrophic patterns are non-negotiable.
+    // A wrapper is not a disguise. The tiers are matched against every
+    // command hiding inside this one as well as the one as written, because
+    // `bash -c 'rm -rf /'` used to reach the ASK tier and `find -exec rm`
+    // reached nothing at all.
+    const forms = unwrapCommand(normalized).map(normalize).filter(Boolean);
+
+    // Hard floor: catastrophic patterns are non-negotiable, wherever they hide.
     for (const rule of CATASTROPHIC) {
-      if (rule.re.test(normalized)) return { action: "block", rule: rule.name };
+      for (const form of forms) {
+        if (rule.re.test(form)) return { action: "block", rule: rule.name };
+      }
     }
 
     // Builtin destructive verdict, then user rules last-match-wins on top.
     let verdict: RuleHit = { action: "allow", rule: "default" };
-    for (const rule of DESTRUCTIVE) {
-      if (rule.re.test(normalized)) {
-        verdict = { action: rule.action, rule: rule.name };
-        break;
+    outer: for (const rule of DESTRUCTIVE) {
+      for (const form of forms) {
+        if (rule.re.test(form)) {
+          verdict = { action: rule.action, rule: rule.name };
+          break outer;
+        }
       }
     }
     if (verdict.action === "allow") {
-      const secrets = secretPathsIn(normalized);
-      if (secrets.length > 0) verdict = { action: "ask", rule: `secret:${secrets.join(",")}` };
+      const secrets = forms.flatMap((form) => secretPathsIn(form));
+      if (secrets.length > 0) verdict = { action: "ask", rule: `secret:${[...new Set(secrets)].join(",")}` };
+    }
+    // A command whose payload cannot be read proves nothing about itself, and
+    // "I could not tell" must not round down to yes.
+    if (verdict.action === "allow") {
+      const opaque = opacityOf(normalized);
+      if (opaque) verdict = { action: "ask", rule: `opaque:${opaque}` };
     }
     for (const rule of userRules) {
       try {

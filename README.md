@@ -35,6 +35,29 @@ Bare `/yolo` still flips between `yolo` and `approve` — the two ends people ac
 
 Fail-closed everywhere: rule-evaluation errors block; ASK without a UI (headless/CI) denies.
 
+### A wrapper is not a disguise
+
+The tiers used to be matched against the command as written, which made them exactly as strong as the writing. Measured against the shipped rules:
+
+```
+rm -rf /                             block
+sudo rm -rf /                        block
+bash -c 'rm -rf /'                   ask      ← the quotes broke the match
+sh -c "rm -rf /"                     ask
+eval "$DANGEROUS"                    allow    ← nothing to match at all
+find . -name '*.ts' -exec rm {} +    allow
+```
+
+Three of those went straight through a floor this page called *never overridable*. A floor with a `bash -c` shaped hole is not a floor.
+
+Every command is now matched along with the commands hiding inside it: shell wrappers (`bash -c`, `sh -c`), transparent prefixes (`sudo`, `env FOO=1`, `nohup`, `nice`, a bare `VAR=x`), `xargs`, `find -exec`, and each side of a `&&`, `||`, `;` or `|` chain — because a safe left half must not vouch for a dangerous right half. Unwrapping only ever produces *more* strings to check, never fewer, so it can add a verdict but never remove one.
+
+And a command whose payload cannot be read at all — `eval "$CMD"`, `sh -c "$SCRIPT"`, `base64 -d … | sh` — is asked about rather than allowed. It is not dangerous because of what it says; it says nothing. Passing it because no pattern matched is answering *"is this safe?"* with *"I could not tell"*, which is the one answer a gate must never round down to yes.
+
+Two smaller gaps surfaced while testing the fix: `rm -rf` at the end of a string never matched (the rule required trailing whitespace, so `xargs rm -rf` — which takes its paths from stdin — read as harmless), and `find -exec rm` unwraps to a bare `rm` that no tier flags, so the pairing is now its own rule.
+
+One known false positive remains, and it predates this: `echo 'rm -rf / is dangerous'` blocks, because the tiers match text rather than parse shell. Erring that way is the intended direction.
+
 ## Writing a file nobody looked at
 
 pi's `write` tool replaces a file whole, with no requirement that anyone ever read it. `edit` matches its `oldString` against what is on disk, which proves the string is there and nothing about whether the agent knew what else was. So two shapes get through upstream, and both destroy work:
