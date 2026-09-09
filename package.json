@@ -1,6 +1,6 @@
 {
   "name": "@pify/yolo",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "description": "One toggle to auto-approve everything, with an undo trail: three-tier bash guard, file pre-images, fail-closed everywhere",
   "keywords": [
     "pi-package",
