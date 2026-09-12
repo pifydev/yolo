@@ -46,6 +46,7 @@ import {
   type Classification,
 } from "../src/classify.ts";
 import { evaluateCommand, evaluatePath, parseUserRules } from "../src/rules.ts";
+import { withUiLock } from "../src/ui-lock.ts";
 import { ReadLedger, assessBlindWrite, blindTitle } from "../src/reads.ts";
 import {
   RESTORE_LABELS,
@@ -209,9 +210,9 @@ export default function yolo(pi: ExtensionAPI) {
         reason: `yolo guard: ${verdict.reason} No UI to confirm (fail-closed deny). Read the file first.`,
       };
     }
-    const approved = await ctx.ui.confirm(blindTitle(verdict.kind), `${verdict.reason}
+    const approved = await withUiLock(() => ctx.ui.confirm(blindTitle(verdict.kind), `${verdict.reason}
 
-Go ahead anyway?`);
+Go ahead anyway?`));
     if (approved) {
       // Approving it means the user has taken responsibility for this file;
       // asking again on the next edit would be nagging, not guarding.
@@ -240,10 +241,10 @@ Go ahead anyway?`);
         reason: `yolo guard: ${path} holds secret material (${rule}) and there is no UI to confirm (fail-closed deny).`,
       };
     }
-    const approved = await ctx.ui.confirm(
+    const approved = await withUiLock(() => ctx.ui.confirm(
       "Secret file",
       `${path}\n\nRule: ${rule}. Allow this access?`,
-    );
+    ));
     if (approved) return undefined;
     return {
       block: true,
@@ -377,10 +378,10 @@ Go ahead anyway?`);
     });
     if (verdict !== "ask") return verdict === "allow";
 
-    const approved = await ctx.ui.confirm(
+    const approved = await withUiLock(() => ctx.ui.confirm(
       "Load this project's command rules?",
       consentQuestion("its own rules for the command gate, which can relax what gets confirmed", path),
-    );
+    ));
     try {
       writeFileSync(file, `${JSON.stringify(writeConsent(store, ctx.cwd, "yolo", approved), null, 2)}
 `);
@@ -469,14 +470,14 @@ Go ahead anyway?`);
         reason: `yolo guard: '${verdict.rule}' needs confirmation but no UI is available (fail-closed deny).`,
       };
     }
-    const approved = await ctx.ui.confirm(
+    const approved = await withUiLock(() => ctx.ui.confirm(
       askTitle(mode, verdict),
       `${command}\n\nRule: ${verdict.rule}. Run it?`,
-    );
+    ));
     if (approved) return undefined;
 
     // Reject-with-reason: the user's why helps the agent adjust course.
-    const reason = await ctx.ui.input("Why not? (optional — sent to the agent)");
+    const reason = await withUiLock(() => ctx.ui.input("Why not? (optional — sent to the agent)"));
     return {
       block: true,
       reason: reason?.trim()
@@ -665,11 +666,11 @@ Go ahead anyway?`);
             return;
           }
           const labels = choices.map((c) => RESTORE_LABELS[c]);
-          const picked = await ctx.ui.select("Rewind what?", labels);
+          const picked = await withUiLock(() => ctx.ui.select("Rewind what?", labels));
           if (picked === undefined) return;
           const choice = choices[labels.indexOf(picked)] as RestoreChoice;
 
-          if (!(await ctx.ui.confirm("Rewind", restoreSummary(point, choice)))) return;
+          if (!(await withUiLock(() => ctx.ui.confirm("Rewind", restoreSummary(point, choice))))) return;
 
           if (choice === "code" || choice === "both") {
             // `git checkout <stash-sha> -- .` writes that tree over the working
@@ -726,10 +727,10 @@ Go ahead anyway?`);
             ctx.ui.notify("Nothing to undo — the trail has no file entries.", "warning");
             return;
           }
-          const ok = await ctx.ui.confirm(
+          const ok = await withUiLock(() => ctx.ui.confirm(
             "Undo file changes",
             `Restore ${preview.length} file(s) to their pre-images?\n${preview.map((e) => e.target).join("\n")}`,
-          );
+          ));
           if (!ok) return;
           const result = undo(dir, count);
           ctx.ui.notify(
