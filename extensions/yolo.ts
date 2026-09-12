@@ -465,9 +465,13 @@ Go ahead anyway?`));
 
     // ASK tier.
     if (!ctx.hasUI) {
+      // No one to answer: deny AND stop. Continuing would leave the model
+      // retrying cosmetic variants of a command it can never get approved,
+      // one blocked request each, against a wall.
       return {
         block: true,
-        reason: `yolo guard: '${verdict.rule}' needs confirmation but no UI is available (fail-closed deny).`,
+        terminate: true,
+        reason: `yolo guard: '${verdict.rule}' needs confirmation but no UI is available (fail-closed deny). No approval is possible in this run.`,
       };
     }
     const approved = await withUiLock(() => ctx.ui.confirm(
@@ -476,13 +480,19 @@ Go ahead anyway?`));
     ));
     if (approved) return undefined;
 
-    // Reject-with-reason: the user's why helps the agent adjust course.
+    // Reject-with-reason: the user's why helps the agent adjust course. A
+    // decline also STOPS the turn (terminate) rather than inviting the model
+    // to try again — a "no" from the person is a decision to hand control
+    // back, not a nudge to reword. pi only terminates when every blocked call
+    // in the batch asks to, so a decline amid parallel successes won't strand
+    // the others.
     const reason = await withUiLock(() => ctx.ui.input("Why not? (optional — sent to the agent)"));
     return {
       block: true,
+      terminate: true,
       reason: reason?.trim()
-        ? `The user declined (${verdict.rule}): ${reason.trim()}`
-        : `The user declined this command (${verdict.rule}). Choose a different approach.`,
+        ? `The user declined (${verdict.rule}) and stopped the turn: ${reason.trim()}`
+        : `The user declined this command (${verdict.rule}) and stopped the turn.`,
     };
   });
 
