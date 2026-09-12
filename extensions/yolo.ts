@@ -259,21 +259,29 @@ Go ahead anyway?`);
   async function classifyCommand(ctx: UiContext, command: string): Promise<Classification> {
     let session: AgentSession | null = null;
     try {
+      // `reload()` is not optional. `createAgentSession` only loads a resource
+      // loader it builds itself; one passed in is used exactly as handed over,
+      // and a fresh DefaultResourceLoader resolves neither `systemPrompt` nor
+      // `appendSystemPrompt` until it loads. Without it the child ran with no
+      // instructions at all — the call succeeds, the model answers, and it
+      // answers as a generic assistant with nothing to say it went wrong.
+      const loader = new DefaultResourceLoader({
+        cwd: ctx.cwd,
+        agentDir: getAgentDir(),
+        noExtensions: true,
+        noPromptTemplates: true,
+        noThemes: true,
+        // Replace the coding-agent prompt rather than append to it: with
+        // the default prompt in place, models answer a classification
+        // request with a markdown explanation instead of the JSON line.
+        systemPrompt: CLASSIFY_SYSTEM_PROMPT.join(" "),
+      } as never);
+      await loader.reload();
       const created = await createAgentSession({
-        sessionManager: SessionManager.inMemory(ctx.cwd),
-        model: ctx.model as never,
-        tools: [],
-        resourceLoader: new DefaultResourceLoader({
-          cwd: ctx.cwd,
-          agentDir: getAgentDir(),
-          noExtensions: true,
-          noPromptTemplates: true,
-          noThemes: true,
-          // Replace the coding-agent prompt rather than append to it: with
-          // the default prompt in place, models answer a classification
-          // request with a markdown explanation instead of the JSON line.
-          systemPrompt: CLASSIFY_SYSTEM_PROMPT.join(" "),
-        } as never),
+      sessionManager: SessionManager.inMemory(ctx.cwd),
+      model: ctx.model as never,
+      tools: [],
+      resourceLoader: loader,
       });
       session = created.session;
       await session.prompt(buildClassifyPrompt(command, ctx.cwd), {
