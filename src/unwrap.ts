@@ -69,6 +69,48 @@ function unquote(text: string): string {
 }
 
 /**
+ * Contents of every command substitution in the text: $(...), `...`, and the
+ * process substitutions <(...) and >(...).
+ *
+ * A substitution RUNS its contents before the outer command sees a byte, so
+ * `echo done $(rm -rf ~/)` is not an echo with an odd argument — it is an rm
+ * with an echo around it. Before this, the payload inside $() reached the
+ * tiers only as noise in the middle of the outer form, where the anchored
+ * catastrophic patterns cannot match, and the whole thing rated as merely
+ * destructive — which auto-runs in yolo and auto modes. A floor the
+ * catastrophic tier cannot see through is not a floor.
+ *
+ * Parenthesis-matching, because substitutions nest. Deliberately blind to
+ * quoting: `echo '$(rm -rf /)'` is literal in the shell and this still
+ * extracts it, which can only make the verdict stricter — a false "ask" on a
+ * command that quotes a catastrophe as text is the safe direction to be
+ * wrong in, and full shell quote parsing is how a gate grows holes. A
+ * backslash-escaped \$( is skipped, since that much is unambiguous.
+ */
+export function substitutions(text: string): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < text.length - 1; i++) {
+    const pair = text[i]! + text[i + 1]!;
+    if (pair !== "$(" && pair !== "<(" && pair !== ">(") continue;
+    if (i > 0 && text[i - 1] === "\\") continue;
+    let depth = 1;
+    for (let j = i + 2; j < text.length; j++) {
+      if (text[j] === "(") depth++;
+      else if (text[j] === ")") {
+        depth--;
+        if (depth === 0) {
+          out.push(text.slice(i + 2, j).trim());
+          break;
+        }
+      }
+    }
+  }
+  // Backticks cannot nest; a pair delimits one substitution.
+  for (const m of text.matchAll(/`([^`]+)`/g)) out.push(m[1]!.trim());
+  return out.filter(Boolean);
+}
+
+/**
  * Every command hiding inside this one, including the original.
  *
  * Bounded on purpose: wrappers nest, but a handful of layers covers what
@@ -106,6 +148,12 @@ export function unwrapCommand(command: string, depth = 6): string[] {
     // vouch for a dangerous right half.
     for (const part of text.split(/\s*(?:&&|\|\||;|\|)\s*/)) {
       if (part && part !== text) queue.push(part);
+    }
+
+    // A substitution runs before the command around it; its contents are a
+    // command in their own right and get the same treatment.
+    for (const inner of substitutions(text)) {
+      if (inner !== text) queue.push(inner);
     }
   }
 

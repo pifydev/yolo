@@ -111,8 +111,8 @@ try {
     }
   }
 } finally {
-  rmSync(agentDir, { recursive: true, force: true });
-  rmSync(repo, { recursive: true, force: true });
+  rmSync(agentDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+  rmSync(repo, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
 }
 
 console.log(`${NL}${passed}/${passed + failed} passed`);

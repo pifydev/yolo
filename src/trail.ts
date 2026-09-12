@@ -9,6 +9,7 @@ import {
 } from "node:fs";
 import { basename, join } from "node:path";
 import type { TrailEntry } from "./types.ts";
+import { localStamp } from "./rewind.ts";
 
 /**
  * The undo trail: before every edit/write the file's pre-image is saved, and
@@ -172,7 +173,7 @@ export function formatTrail(entries: TrailEntry[], limit: number): string {
   const recent = entries.slice(-limit).reverse();
   return recent
     .map((e) => {
-      const when = new Date(e.timestamp).toISOString().replace("T", " ").slice(0, 19);
+      const when = localStamp(e.timestamp);
       if (e.type === "file") {
         return `#${e.seq} ${when} file  ${e.target}${e.existed ? "" : " (new file)"}`;
       }

@@ -161,10 +161,18 @@ export function evaluateCommand(command: string, userRules: UserRule[] = []): Ru
       if (secrets.length > 0) verdict = { action: "ask", rule: `secret:${[...new Set(secrets)].join(",")}` };
     }
     // A command whose payload cannot be read proves nothing about itself, and
-    // "I could not tell" must not round down to yes.
+    // "I could not tell" must not round down to yes. Checked per form, not
+    // just on the original: `sh -c` unwraps to an inner command, and an
+    // opaque INNER command — an eval buried one wrapper down — is exactly as
+    // unreadable as an opaque outer one.
     if (verdict.action === "allow") {
-      const opaque = opacityOf(normalized);
-      if (opaque) verdict = { action: "ask", rule: `opaque:${opaque}` };
+      for (const form of forms) {
+        const opaque = opacityOf(form);
+        if (opaque) {
+          verdict = { action: "ask", rule: `opaque:${opaque}` };
+          break;
+        }
+      }
     }
     for (const rule of userRules) {
       try {

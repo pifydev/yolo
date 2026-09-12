@@ -43,8 +43,19 @@ export function rewindPoints(entries: readonly TrailEntry[]): RewindPoint[] {
     }));
 }
 
+/** Local wall-clock stamp — the clock the person at the keyboard lives in. */
+export function localStamp(timestamp: number): string {
+  // Local wall-clock time, because that is the clock the person choosing a
+  // checkpoint was living in. toISOString() is UTC dressed as local: it
+  // rendered every checkpoint seven hours off for a UTC+7 user, with no
+  // timezone marker to say so.
+  const d = new Date(timestamp);
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
+
 function when(timestamp: number): string {
-  return new Date(timestamp).toISOString().replace("T", " ").slice(0, 19);
+  return localStamp(timestamp);
 }
 
 /** One line per prompt, newest first, numbered the way you will pick them. */
