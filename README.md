@@ -1,5 +1,7 @@
 # @pify/yolo
 
+[![npm version](https://img.shields.io/npm/v/@pify/yolo)](https://www.npmjs.com/package/@pify/yolo) [![npm downloads](https://img.shields.io/npm/dm/@pify/yolo)](https://www.npmjs.com/package/@pify/yolo)
+
 A safety gradient for [pi](https://github.com/earendil-works/pi), from auto-approve-everything to ask-about-anything — with an undo trail so YOLO never means unrecoverable.
 
 Part of the [Pify suite](https://github.com/pifydev). Install with [`pify install yolo`](https://github.com/pifydev/cli) or `pi install npm:@pify/yolo`.
