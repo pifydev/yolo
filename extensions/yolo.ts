@@ -63,8 +63,8 @@ import {
   decideConsent,
   envConsent,
   parseConsent,
+  persistConsent,
   readConsent,
-  writeConsent,
 } from "../src/consent.ts";
 import {
   DEFAULT_RETENTION_DAYS,
@@ -383,8 +383,7 @@ Go ahead anyway?`));
       consentQuestion("its own rules for the command gate, which can relax what gets confirmed", path),
     ));
     try {
-      writeFileSync(file, `${JSON.stringify(writeConsent(store, ctx.cwd, "yolo", approved), null, 2)}
-`);
+      persistConsent(file, ctx.cwd, "yolo", approved);
     } catch {
       // An unwritable consent file costs us the memory of the answer, not the answer.
     }
