@@ -25,12 +25,18 @@ const CATASTROPHIC: BuiltinRule[] = [
   { name: "fork-bomb", action: "block", re: /:\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:/ },
   { name: "chmod-777-root", action: "block", re: /\bchmod\s+(-\w+\s+)*777\s+\/(\s|$)/ },
   { name: "write-device", action: "block", re: />\s*\/dev\/(sd[a-z]|nvme\d|disk\d)/ },
+  // Windows: formatting a drive is the mkfs of this platform. Anchored to a
+  // command boundary so the `--format` flag of other tools is not caught.
+  { name: "win-format", action: "block", re: /(^|[\s;&|(])format\s+(?:\/[\w:]+\s+)*[a-zA-Z]:/i },
 ];
 
 /** Destructive — confirmation required in guard mode; user rules may retune. */
 const DESTRUCTIVE: BuiltinRule[] = [
   { name: "rm-rf", action: "ask", re: /\brm\s+-\w*([rR]\w*[fF]|[fF]\w*[rR])\w*(\s|$)/ },
   { name: "rm-r", action: "ask", re: /\brm\s+-\w*[rR]\w*(\s|$)/ },
+  // GNU long flag: `rm --recursive dir` is `rm -r dir`, and used to auto-run
+  // because the short-flag patterns above never saw it.
+  { name: "rm-r", action: "ask", re: /\brm\s+[^|;&]*--recursive\b/ },
   { name: "git-push-force", action: "ask", re: /\bgit\s+push\b[^|;&]*(\s--force(-with-lease)?\b|\s-f\b)/ },
   { name: "git-reset-hard", action: "ask", re: /\bgit\s+reset\s+--hard\b/ },
   { name: "git-clean-force", action: "ask", re: /\bgit\s+clean\b[^|;&]*\s-\w*[fdx]/ },
@@ -48,6 +54,13 @@ const DESTRUCTIVE: BuiltinRule[] = [
   { name: "chmod-777", action: "ask", re: /\bchmod\s+(-\w+\s+)*777\b/ },
   { name: "truncate", action: "ask", re: /\btruncate\s+-s\s*0\b/ },
   { name: "history-rewrite", action: "ask", re: /\bgit\s+(rebase|filter-branch|filter-repo)\b/ },
+  // Windows destructive shapes. `rmdir`/`rd` and `del` recurse a whole tree
+  // with `/s`; PowerShell's `Remove-Item -Recurse` is `rm -rf` by another
+  // name. Flags are case-insensitive on Windows, and the payload may arrive
+  // through `cmd /c` or `powershell -Command`, which unwrapCommand sees through.
+  { name: "win-rmdir", action: "ask", re: /\b(?:rmdir|rd)\b[^|;&]*\/[sS]\b/i },
+  { name: "win-del", action: "ask", re: /\bdel\b[^|;&]*\/[sS]\b/i },
+  { name: "win-remove-item", action: "ask", re: /\bremove-item\b[^|;&]*\s-r(?:ecurse)?\b/i },
 ];
 
 /**
@@ -128,6 +141,80 @@ function normalize(command: string): string {
   return command.replace(/\s+/g, " ").trim();
 }
 
+/** Actions ordered by restrictiveness, for "most restrictive wins". */
+const SEVERITY: Record<RuleAction, number> = { allow: 0, ask: 1, block: 2 };
+
+/**
+ * A catastrophic-rm supplement that runs ALONGSIDE the anchored regexes in
+ * CATASTROPHIC and only ever ADDS a block. Those regexes miss several shapes
+ * that still wipe a filesystem root: GNU long flags (`rm --recursive --force
+ * /`), a `--` end-of-options separator (`rm -rf -- /`), doubled or dotted
+ * roots (`//`, `/.`, `/..`), an ANSI-C quoted target (`rm -rf $'/'`), and a
+ * Windows drive root (`rm -rf C:\`). This detects any rm carrying a recursive
+ * flag whose target normalizes to a root, and errs toward blocking — only true
+ * roots, never a deep path like `/home/x/tmp`.
+ */
+function rmRecursivelyHitsRoot(command: string): boolean {
+  // `rm` used as a command word: at the start or after a shell separator.
+  for (const match of command.matchAll(/(?:^|[\s;&|(])rm(?=\s)/g)) {
+    const rest = command.slice((match.index ?? 0) + match[0].length);
+    if (rmArgsHitRoot(rest)) return true;
+  }
+  return false;
+}
+
+/** Whether an rm argument list carries a recursive flag and a root target. */
+function rmArgsHitRoot(rest: string): boolean {
+  let recursive = false;
+  let target = false;
+  let optionsEnded = false;
+  for (const token of rest.split(/\s+/)) {
+    if (token === "") continue;
+    if (!optionsEnded && token === "--") {
+      optionsEnded = true;
+      continue;
+    }
+    if (!optionsEnded && token.startsWith("-")) {
+      // A recursive flag: --recursive, or a short cluster containing r/R.
+      if (token === "--recursive" || (/^-[a-zA-Z]+$/.test(token) && /[rR]/.test(token))) {
+        recursive = true;
+      }
+      continue; // any other flag (--force, --no-preserve-root, …)
+    }
+    if (isFilesystemRoot(token)) target = true;
+  }
+  return recursive && target;
+}
+
+/** True when a bare rm target normalizes to a filesystem root. */
+function isFilesystemRoot(rawTarget: string): boolean {
+  const t = stripQuotes(rawTarget);
+  if (t === "") return false;
+  if (t === "~" || t === "$HOME" || t === "${HOME}") return true;
+  // Windows backslashes → forward, then collapse runs of slashes.
+  const collapsed = t.replace(/\\/g, "/").replace(/\/{2,}/g, "/");
+  if (collapsed === "/" || collapsed === "/." || collapsed === "/.." || collapsed === "/*") return true;
+  // A bare drive root: C:, C:/, C:\ (already forward-slashed above).
+  if (/^[a-zA-Z]:\/?$/.test(collapsed)) return true;
+  return false;
+}
+
+/** Strip surrounding quotes and a $'…' / $"…" ANSI-C wrapper, repeatedly. */
+function stripQuotes(raw: string): string {
+  let t = raw.trim();
+  let prev = "";
+  while (t !== prev) {
+    prev = t;
+    if (t.length >= 3 && (t.startsWith("$'") || t.startsWith('$"')) && t.at(-1) === t[1]) {
+      t = t.slice(2, -1);
+    } else if (t.length >= 2 && (t[0] === '"' || t[0] === "'") && t.at(-1) === t[0]) {
+      t = t.slice(1, -1);
+    }
+    t = t.trim();
+  }
+  return t;
+}
+
 export function evaluateCommand(command: string, userRules: UserRule[] = []): RuleHit {
   try {
     const normalized = normalize(command);
@@ -144,6 +231,11 @@ export function evaluateCommand(command: string, userRules: UserRule[] = []): Ru
       for (const form of forms) {
         if (rule.re.test(form)) return { action: "block", rule: rule.name };
       }
+    }
+    // Robust supplement to the anchored rm patterns above (adds blocks only,
+    // never weakens them): a recursive rm whose target normalizes to a root.
+    for (const form of forms) {
+      if (rmRecursivelyHitsRoot(form)) return { action: "block", rule: "rm-rf-root" };
     }
 
     // Builtin destructive verdict, then user rules last-match-wins on top.
@@ -174,6 +266,8 @@ export function evaluateCommand(command: string, userRules: UserRule[] = []): Ru
         }
       }
     }
+    // User rules, last-match-wins on the command as written — all three
+    // actions, preserving the historical semantics and the conservative allow.
     for (const rule of userRules) {
       try {
         if (wildcardToRegex(rule.pattern).test(normalized)) {
@@ -181,6 +275,25 @@ export function evaluateCommand(command: string, userRules: UserRule[] = []): Ru
         }
       } catch {
         // invalid user pattern — ignore that rule
+      }
+    }
+    // A wrapper must not void a block/ask rule the user wrote: `sudo npm run
+    // deploy` and `bash -c 'npm run deploy'` both hide `npm run deploy`, so a
+    // restrictive rule is matched against every hidden form too and the most
+    // restrictive wins. ALLOW rules stay matched against the original only (the
+    // conservative asymmetry), so a wrapper can only ever tighten, never relax.
+    const hidden = forms.filter((form) => form !== normalized);
+    if (hidden.length > 0) {
+      for (const rule of userRules) {
+        if (rule.action === "allow") continue;
+        try {
+          const re = wildcardToRegex(rule.pattern);
+          if (hidden.some((form) => re.test(form)) && SEVERITY[rule.action] > SEVERITY[verdict.action]) {
+            verdict = { action: rule.action, rule: `user:${rule.pattern}` };
+          }
+        } catch {
+          // invalid user pattern — ignore that rule
+        }
       }
     }
     return verdict;

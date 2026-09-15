@@ -56,6 +56,15 @@ const SHELL_C =
 const XARGS = /^xargs\s+(?:-\w+(?:\s*\S+)?\s+)*(.*)$/;
 const FIND_EXEC = /\s-(?:exec|execdir)\s+(.+?)\s*(?:\\;|;|\{\}\s*\+|\+)\s*$/;
 
+/**
+ * Windows shells hide a payload exactly as `sh -c` does. `cmd /c <script>`
+ * (and `/k`) run the rest; PowerShell's `-Command`/`-c` does the same, after
+ * any number of leading switches (`-NoProfile`, `-ExecutionPolicy Bypass`).
+ * Case-insensitive, since Windows verbs and switches are.
+ */
+const CMD_C = /^cmd(?:\.exe)?\s+(?:\/\S+\s+)*\/[ck]\s+(.+)$/i;
+const POWERSHELL_C = /^(?:powershell|pwsh)(?:\.exe)?\b.*?\s-c(?:ommand)?\s+(.+)$/i;
+
 /** Strip one layer of matching quotes, if the whole string is wrapped in them. */
 function unquote(text: string): string {
   const trimmed = text.trim();
@@ -143,6 +152,12 @@ export function unwrapCommand(command: string, depth = 6): string[] {
 
     const exec = FIND_EXEC.exec(text);
     if (exec?.[1]) queue.push(unquote(exec[1]));
+
+    const cmdc = CMD_C.exec(text);
+    if (cmdc?.[1]) queue.push(unquote(cmdc[1]));
+
+    const psc = POWERSHELL_C.exec(text);
+    if (psc?.[1]) queue.push(unquote(psc[1]));
 
     // Each side of a chain is its own command; a safe left half must not
     // vouch for a dangerous right half.
