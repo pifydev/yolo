@@ -26,8 +26,21 @@ const CATASTROPHIC: BuiltinRule[] = [
   { name: "chmod-777-root", action: "block", re: /\bchmod\s+(-\w+\s+)*777\s+\/(\s|$)/ },
   { name: "write-device", action: "block", re: />\s*\/dev\/(sd[a-z]|nvme\d|disk\d)/ },
   // Windows: formatting a drive is the mkfs of this platform. Anchored to a
-  // command boundary so the `--format` flag of other tools is not caught.
-  { name: "win-format", action: "block", re: /(^|[\s;&|(])format\s+(?:\/[\w:]+\s+)*[a-zA-Z]:/i },
+  // command boundary — or a path separator / quote, so `format.com D:`,
+  // `C:\Windows\System32\format.com D:` and `& 'format.com' D:` are the same
+  // verb — while the `--format` flag of other tools is still not caught.
+  {
+    name: "win-format",
+    action: "block",
+    re: /(^|[\s;&|(\\/'"])format(?:\.com|\.exe)?["']?\s+(?:\/[\w:]+\s+)*["']?[a-zA-Z]:/i,
+  },
+  // PowerShell's own disk destroyers, and diskpart. No coding task formats
+  // a volume or clears a disk; a script that does is not one to auto-run.
+  {
+    name: "win-disk",
+    action: "block",
+    re: /(^|[\s;&|(\\/'"])(?:format-volume|clear-disk|initialize-disk|remove-partition|diskpart)(?:\.exe)?\b/i,
+  },
 ];
 
 /** Destructive — confirmation required in guard mode; user rules may retune. */
@@ -82,9 +95,35 @@ const SECRET_PATHS: BuiltinRule[] = [
 /** Example/sample templates carry no secrets — never worth a prompt. */
 const SECRET_EXEMPT = /(^|\/)[\w.-]*\.(example|sample|template|dist)$|\.pub$/;
 
-/** Name of the secret class this path belongs to, or null. */
+/**
+ * `./`, `a/../` and empty segments folded away, the way path.resolve will
+ * fold them before the file is opened. Suffix matching is all the secret
+ * rules do, so a leading `..` that cannot pop is simply dropped: `../.env`
+ * still ends in `/.env` wherever it lands.
+ */
+function foldPath(path: string): string {
+  const parts: string[] = [];
+  for (const segment of path.split("/")) {
+    if (segment === "" || segment === ".") continue;
+    if (segment === "..") {
+      parts.pop();
+      continue;
+    }
+    parts.push(segment);
+  }
+  return parts.join("/");
+}
+
+/**
+ * Name of the secret class this path belongs to, or null. Judged on the path
+ * as the tool will resolve it, not as the agent spelled it: pi strips a
+ * leading `@` (an attachment marker), and path.resolve drops a trailing
+ * slash and folds `./` and `a/../` away — so `@.env`, `.env/` and
+ * `./x/../.env` all open the same file, and used to open it unasked.
+ */
 export function secretPathKind(path: string): string | null {
-  const normalized = path.trim().replace(/\\/g, "/").replace(/^["']|["']$/g, "").toLowerCase();
+  const spelled = path.trim().replace(/^["']|["']$/g, "").replace(/^@/, "").replace(/\\/g, "/");
+  const normalized = foldPath(spelled).toLowerCase();
   if (!normalized || SECRET_EXEMPT.test(normalized)) return null;
   for (const rule of SECRET_PATHS) {
     if (rule.re.test(normalized)) return rule.name;
@@ -186,6 +225,51 @@ function rmArgsHitRoot(rest: string): boolean {
   return recursive && target;
 }
 
+/**
+ * The same supplement for the Windows side. pi 0.85 runs `powershell` as a
+ * first-class tool, where `Remove-Item -Recurse -Force C:\` is `rm -rf /` by
+ * another name — and its aliases (`ri`, `rd`, `rmdir`, `del`, `erase`) and
+ * cmd's `rd /s` spell it several more ways. The `win-remove-item` rule only
+ * ever rated these ASK, which yolo and auto approve. Same contract as the rm
+ * supplement: adds blocks only, and only for true roots.
+ */
+function winRemoveRecursivelyHitsRoot(command: string): boolean {
+  for (const match of command.matchAll(/(?:^|[\s;&|(])(?:remove-item|ri|rd|rmdir|del|erase)(?=\s)/gi)) {
+    const rest = command.slice((match.index ?? 0) + match[0].length);
+    if (winRemoveArgsHitRoot(rest)) return true;
+  }
+  return false;
+}
+
+/** Whether a Remove-Item / rd argument list recurses into a root target. */
+function winRemoveArgsHitRoot(rest: string): boolean {
+  let recursive = false;
+  let target = false;
+  for (const token of rest.split(/\s+/)) {
+    if (token === "") continue;
+    // cmd's `/s` recurses; PowerShell's `-Recurse` may be abbreviated to any
+    // unambiguous prefix (`-r`, `-rec`), and `-Recurse:$true` is the long way.
+    if (/^\/s$/i.test(token)) {
+      recursive = true;
+      continue;
+    }
+    if (token.startsWith("-")) {
+      const colon = token.indexOf(":");
+      const flag = (colon > 0 ? token.slice(1, colon) : token.slice(1)).toLowerCase();
+      if (flag !== "" && "recurse".startsWith(flag)) recursive = true;
+      // `-Path:C:\` joins the value on with a colon, so the target never
+      // arrives as its own token; -Path and -LiteralPath (and any prefix
+      // PowerShell accepts for them) are the two that name one.
+      if (colon > 0 && flag !== "" && ("path".startsWith(flag) || "literalpath".startsWith(flag))) {
+        if (isFilesystemRoot(token.slice(colon + 1))) target = true;
+      }
+      continue; // -Force, -Confirm:$false, …
+    }
+    if (isFilesystemRoot(token)) target = true;
+  }
+  return recursive && target;
+}
+
 /** True when a bare rm target normalizes to a filesystem root. */
 function isFilesystemRoot(rawTarget: string): boolean {
   const t = stripQuotes(rawTarget);
@@ -194,8 +278,10 @@ function isFilesystemRoot(rawTarget: string): boolean {
   // Windows backslashes → forward, then collapse runs of slashes.
   const collapsed = t.replace(/\\/g, "/").replace(/\/{2,}/g, "/");
   if (collapsed === "/" || collapsed === "/." || collapsed === "/.." || collapsed === "/*") return true;
-  // A bare drive root: C:, C:/, C:\ (already forward-slashed above).
-  if (/^[a-zA-Z]:\/?$/.test(collapsed)) return true;
+  // A bare drive root: C:, C:/, C:\ (already forward-slashed above); the
+  // root spelled as itself (C:\. and C:\.., as `/.` and `/..` are above);
+  // or everything directly under it — C:\*, and cmd's idiom C:\*.*.
+  if (/^[a-zA-Z]:(?:\/(?:\.|\.\.|\*|\*\.\*)?)?$/.test(collapsed)) return true;
   return false;
 }
 
@@ -236,6 +322,7 @@ export function evaluateCommand(command: string, userRules: UserRule[] = []): Ru
     // never weakens them): a recursive rm whose target normalizes to a root.
     for (const form of forms) {
       if (rmRecursivelyHitsRoot(form)) return { action: "block", rule: "rm-rf-root" };
+      if (winRemoveRecursivelyHitsRoot(form)) return { action: "block", rule: "win-remove-root" };
     }
 
     // Builtin destructive verdict, then user rules last-match-wins on top.

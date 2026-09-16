@@ -74,7 +74,11 @@ export function recordPreImage(dir: string, filePath: string, now: number): Trai
   }
 }
 
-/** Log a risky/mutating bash command. Never throws. */
+/**
+ * Log a risky/mutating shell command. Never throws. The entry type stays
+ * "bash" for every shell (the manifest format predates pi's powershell tool);
+ * `tool` says which one actually ran it, so the trail reads true.
+ */
 export function recordBash(
   dir: string,
   command: string,
@@ -82,6 +86,7 @@ export function recordBash(
   gitHead: string | null,
   now: number,
   stashSha: string | null = null,
+  tool = "bash",
 ): void {
   try {
     append(dir, {
@@ -92,6 +97,7 @@ export function recordBash(
       saved: null,
       existed: false,
       cwd,
+      tool,
       ...(gitHead ? { gitHead } : {}),
       ...(stashSha ? { stashSha } : {}),
     });
@@ -182,7 +188,7 @@ export function formatTrail(entries: TrailEntry[], limit: number): string {
       }
       const head = e.gitHead ? ` @${e.gitHead.slice(0, 8)}` : "";
       const stash = e.stashSha ? `\n    ↩ git stash apply ${e.stashSha}` : "";
-      return `#${e.seq} ${when} bash  ${e.target}${head}${stash}`;
+      return `#${e.seq} ${when} ${(e.tool ?? "bash").padEnd(4)}  ${e.target}${head}${stash}`;
     })
     .join("\n");
 }

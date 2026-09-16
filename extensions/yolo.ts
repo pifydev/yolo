@@ -2,7 +2,8 @@
  * @pify/yolo — one toggle to auto-approve everything, with an undo trail.
  *
  * A four-mode gradient (v0.4): yolo · auto · approve (default) · strict.
- * Bash runs through a three-tier rule set — catastrophic patterns BLOCK,
+ * Every shell command (pi's bash AND powershell tools) runs through a
+ * three-tier rule set — catastrophic patterns BLOCK,
  * destructive ones ASK with the command shown (denial reasons flow back to
  * the agent), everything else runs — and the mode decides how much of that
  * to relax or tighten. Two invariants hold in every mode: the catastrophic
@@ -16,7 +17,8 @@
  *
  * v0.2 adds two things no mode stands down for:
  * secret material (.env, ssh keys, cloud/registry credentials) asks before
- * any read/edit/write or naming command, and every risky bash command gets a
+ * any read/edit/write/grep or naming command — and grep results that walked
+ * into it are stripped after the fact — and every risky shell command gets a
  * `git stash create` checkpoint recorded on the trail so command damage —
  * not just file edits — has a way back.
  *
@@ -35,6 +37,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { execFileSync } from "node:child_process";
 import { readFileSync, statSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { join } from "node:path";
 
 import {
@@ -46,6 +49,7 @@ import {
   type Classification,
 } from "../src/classify.ts";
 import { evaluateCommand, evaluatePath, parseUserRules } from "../src/rules.ts";
+import { grepFileCandidates, grepSearchRoot, withholdSecretMatches } from "../src/grep.ts";
 import { withUiLock } from "../src/ui-lock.ts";
 import { ReadLedger, assessBlindWrite, blindTitle } from "../src/reads.ts";
 import {
@@ -392,6 +396,14 @@ Go ahead anyway?`));
 
   // ── The gate + the trail ─────────────────────────────────────────────
 
+  /**
+   * grep calls whose secret search path the user approved, by tool-call id.
+   * The result hook withholds secret material after the fact; a yes the
+   * user just gave must survive to that hook, or the question was theatre.
+   * Consumed by the result, so an id is never honoured twice.
+   */
+  const approvedGrep = new Set<string>();
+
   pi.on("tool_call", async (event, ctx) => {
     // Secret material is checked in BOTH modes: yolo trades safety for speed,
     // not for handing credentials to a model.
@@ -421,10 +433,34 @@ Go ahead anyway?`));
       return undefined;
     }
 
-    if (event.toolName !== "bash") return undefined;
+    // grep returns line CONTENT and runs rg with --hidden, so a search path
+    // on secret material is a read by another name. find/ls return names,
+    // not contents, and are not gated.
+    if (event.toolName === "grep") {
+      const path = (event as { input?: { path?: unknown } }).input?.path;
+      if (typeof path === "string") {
+        const verdict = evaluatePath(path, userRules);
+        if (verdict.action !== "allow") {
+          const denial = await guardPath(ctx, path, verdict.rule, verdict.action);
+          if (denial) return denial;
+          // The user said yes to THIS file. The result hook must not then
+          // withhold it — being asked, saying yes and being told to go be
+          // asked is worse than not being asked at all.
+          approvedGrep.add(event.toolCallId);
+        }
+      }
+      return undefined;
+    }
+
+    // pi 0.85 ships `powershell` as a first-class tool with the same {command}
+    // input as bash. It walks the identical path: every rule was right about
+    // `Remove-Item -Recurse -Force C:\`, and a `!== "bash"` early return meant
+    // none of them was ever asked.
+    if (event.toolName !== "bash" && event.toolName !== "powershell") return undefined;
+    const shell = event.toolName;
     const command = (event as { input?: { command?: unknown } }).input?.command;
     if (typeof command !== "string") {
-      return { block: true, reason: "yolo guard: bash call without a command (fail-closed)." };
+      return { block: true, reason: `yolo guard: ${shell} call without a command (fail-closed).` };
     }
 
     let verdict = evaluateCommand(command, userRules);
@@ -432,6 +468,12 @@ Go ahead anyway?`));
     // Layer 3: a model looks at what the regexes had no opinion about. It can
     // only escalate allow → ask, so a talked-into-it classifier cannot open
     // the gate, and a broken one leaves the deterministic verdict standing.
+    //
+    // The obviously-safe prefix list and the classifier prompt are written in
+    // bash. That is fine for powershell too: `ls`, `cat`, `git` and friends
+    // exist there as aliases of read-only cmdlets, so the list is not wrong
+    // about them, and a cmdlet the list does not know is simply sent to the
+    // classifier — which can only escalate, so the worst case is a question.
     if (classifierEnabled && verdict.action === "allow" && needsClassification(command)) {
       const classification = await classifyCommand(ctx, command);
       const escalated = applyClassification(verdict.action, classification);
@@ -450,7 +492,7 @@ Go ahead anyway?`));
     // Log risky commands, with a checkpoint of the tree as it was.
     if (dir && verdict.action !== "allow") {
       const now = Date.now();
-      recordBash(dir, command, ctx.cwd, gitHead(ctx.cwd), now, gitCheckpoint(ctx.cwd, now));
+      recordBash(dir, command, ctx.cwd, gitHead(ctx.cwd), now, gitCheckpoint(ctx.cwd, now), shell);
     }
 
     if (action === "allow") return undefined;
@@ -524,13 +566,45 @@ Go ahead anyway?`));
     recordPrompt(dir, prompt, leaf, ctx.cwd, gitHead(ctx.cwd), now, gitCheckpoint(ctx.cwd, now));
   });
 
-  pi.on("tool_result", async (event) => {
+  pi.on("tool_result", async (event, ctx) => {
+    const name = (event as { toolName?: string }).toolName;
+    // Consume the approval whatever the result was: an id is seen once.
+    const approved = name === "grep" && approvedGrep.delete(event.toolCallId);
+    // A tool that failed changed nothing and returned nothing worth scanning.
+    if ((event as { isError?: boolean }).isError === true) return;
+
+    if (name === "grep") {
+      // The search-path gate above only sees the path the agent named; a
+      // directory search still walks into every .env and ~/.aws/credentials
+      // under it (rg runs with --hidden). Strip those lines here, after the
+      // fact — asking now would be theatre, the command already ran — and
+      // leave everything else byte-identical. User rules apply, so a project
+      // that opted its .env out keeps its grep results whole.
+      const input = (event as { input?: { path?: unknown } }).input;
+      const root = grepSearchRoot(input?.path, ctx.cwd, homedir());
+      const isSecret = (file: string): boolean => {
+        const candidates = grepFileCandidates(root, file);
+        // A file search prints its one file as a bare name, which resolves
+        // to the root itself — the very path the user was asked about and
+        // approved. Files a directory walk reached were never asked about.
+        if (approved && candidates.includes(root)) return false;
+        return candidates.some((candidate) => evaluatePath(candidate, userRules).action !== "allow");
+      };
+      const content = (event as { content?: Array<{ type: string; text?: string }> }).content ?? [];
+      let changed = false;
+      const next = content.map((part) => {
+        if (part.type !== "text" || typeof part.text !== "string") return part;
+        const result = withholdSecretMatches(part.text, isSecret);
+        if (result.withheld.length === 0) return part;
+        changed = true;
+        return { ...part, text: result.text };
+      });
+      return changed ? { content: next as never } : undefined;
+    }
+
     // The agent wrote this content, so it knows what is in the file now.
     // Without this, its own write would make the next edit look stale.
-    const name = (event as { toolName?: string }).toolName;
     if (name !== "write" && name !== "edit") return;
-    // A tool that failed changed nothing, so it taught the agent nothing.
-    if ((event as { isError?: boolean }).isError === true) return;
     const path = (event as { input?: Record<string, unknown> }).input?.path;
     if (typeof path !== "string") return;
     const now = statOf(path);

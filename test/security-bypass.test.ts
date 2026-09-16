@@ -79,6 +79,28 @@ test("Windows destructive shapes ask", () => {
   }
 });
 
+test("catastrophic floor: PowerShell Remove-Item (and aliases) recursing a drive root", () => {
+  // `Remove-Item -Recurse -Force C:\` sat in the ASK tier (win-remove-item),
+  // which yolo/auto approve: the rm-root supplement only knew the word `rm`.
+  for (const command of [
+    "Remove-Item -Recurse -Force C:\\",
+    "remove-item -r -force 'C:\\'",
+    "Remove-Item -Path C:\\ -Recurse",
+    "Remove-Item -Recurse C:\\*",
+    "ri -Recurse -Force C:\\",
+    "rd /s /q C:\\",
+    "rmdir /S C:\\",
+    "Remove-Item -Rec -Force D:/",
+  ]) {
+    assert.equal(verdict(command), "block", command);
+  }
+  // Deep paths stay destructive-tier, and a non-recursive one is not flagged here.
+  assert.equal(verdict("Remove-Item -Recurse -Force C:\\temp"), "ask");
+  assert.equal(verdict("Remove-Item C:\\temp\\x.txt"), "allow");
+  const rules = parseUserRules({ rules: [{ pattern: "*", action: "allow" }] });
+  assert.equal(verdict("Remove-Item -Recurse -Force C:\\", rules), "block");
+});
+
 test("formatting a drive is catastrophic", () => {
   for (const command of ["format C:", "format /q D:", "format /FS:NTFS /Q E:"]) {
     assert.equal(verdict(command), "block", command);

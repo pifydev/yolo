@@ -30,6 +30,8 @@ export interface TrailEntry {
   /** file: whether the file existed before the change. */
   existed: boolean;
   cwd?: string;
+  /** bash: which shell tool ran it ("bash" | "powershell"); absent on older entries means bash. */
+  tool?: string;
   gitHead?: string;
   /** bash/prompt: dangling `git stash create` commit holding the tree as it stood. */
   stashSha?: string;

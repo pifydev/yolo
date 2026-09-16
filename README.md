@@ -31,11 +31,13 @@ Bare `/yolo` still flips between `yolo` and `approve` — the two ends people ac
 
 | Tier | Examples | Behavior |
 |---|---|---|
-| **BLOCK** | `rm -rf /`, `rm -rf ~`, `rm -rf .git`, `mkfs`, `dd of=/dev/…`, fork bomb, `> /dev/sda` | Refused outright, in every mode. Never overridable — not by user rules, not by a mode. |
+| **BLOCK** | `rm -rf /`, `rm -rf ~`, `rm -rf .git`, `mkfs`, `dd of=/dev/…`, fork bomb, `> /dev/sda`, `format C:`/`Format-Volume`/`Clear-Disk`, `Remove-Item -Recurse C:\` | Refused outright, in every mode. Never overridable — not by user rules, not by a mode. |
 | **ASK** | `rm -rf <path>`, `git push --force`, `git reset --hard`, `git clean -f`, `curl \| sh`, `find -delete`, `chmod 777`, history rewrites | Confirmation dialog with the command shown. Denials can carry your reason back to the agent. |
 | ALLOW | everything else | Runs untouched (unless you are in `strict`). |
 
 Fail-closed everywhere: rule-evaluation errors block; ASK without a UI (headless/CI) denies.
+
+pi's `powershell` tool walks the same gate as `bash` — same tiers, same confirmation, same trail entry (which says `powershell`, so you can tell them apart). It used to walk past it: the gate returned early on any tool that was not literally named `bash`, so `Remove-Item -Recurse -Force C:\` ran unasked in every mode. The obviously-safe list and the classifier prompt are written in bash, which is fine here — `ls`, `cat`, `git` are aliases of read-only cmdlets in PowerShell, and a cmdlet the list does not know simply goes to the classifier, which can only escalate.
 
 ### A wrapper is not a disguise
 
@@ -80,11 +82,21 @@ The answer to a refusal is always available: reads are cheap, and the agent is t
 
 ## Secret files
 
-Credentials are the one thing no mode waves through — auto-approving speed is worth it, auto-approving your AWS keys into a prompt is not. Any `read`/`edit`/`write` on secret material, and any bash command that names it, asks first in every mode:
+Credentials are the one thing no mode waves through — auto-approving speed is worth it, auto-approving your AWS keys into a prompt is not. Any `read`/`edit`/`write`/`grep` on secret material, and any `bash` or `powershell` command that names it, asks first in every mode:
 
 `.env` (and `.env.*`, but not `.env.example`/`.sample`/`.template`) · `~/.ssh/*` and `id_rsa`/`id_ed25519`-style keys (`.pub` halves are fine) · `.aws/credentials` · `.pi/agent/auth.json`, `.claude/.credentials.json` · `.npmrc`, `.pypirc`, `.netrc`, `.git-credentials` · `~/.config/gh/hosts.yml` · `*.pem`, `*.key`, `*.p12`, `*.pfx` · `secrets.json`/`credentials.yaml`
 
-A user rule opts a project out: `{ "pattern": "*/.env", "action": "allow" }`.
+`grep` is a read by another name: it returns matching line *content*, and pi runs ripgrep with `--hidden`. So a search whose `path` is secret material asks, exactly like `read` would — and a yes means yes: that search comes back whole. A directory search is the harder half — `grep {pattern:"AWS_SECRET", path:"."}` walks into every `.env` under it, and nobody named the file. Those lines are withheld from the result after the fact, one note per file in place of its matches, and everything else comes back byte-for-byte:
+
+```
+src/config.ts:3: const url = process.env.DATABASE_URL;
+[yolo] 2 matching lines in .env withheld: secret material — use read on it to be asked
+README.md:12: Copy .env.example to .env and fill it in.
+```
+
+It strips rather than asks because the command has already run; a question whose answer changes nothing is noise. `find` and `ls` return names, not contents, and are not gated.
+
+A user rule opts a project out of both the question and the withholding: `{ "pattern": "*/.env", "action": "allow" }`.
 
 ## Trust and retention
 
