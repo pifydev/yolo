@@ -8,7 +8,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -163,6 +163,61 @@ test("grep: matching lines from secret files are withheld from the result", asyn
     assert.equal(await host.toolResult("grep", { pattern: "x", path: "." }, ".env:1: X=1", true), undefined);
   } finally {
     rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("f186: the read ledger is rebuilt from the persisted branch, so a resumed edit passes", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pify-yolo-reads-"));
+  const agentDir = mkdtempSync(join(tmpdir(), "pify-yolo-agent-"));
+  const prev = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+  try {
+    const host = new StubHost({ cwd, hasUI: true, confirm: false });
+    yolo(host.api as unknown as ExtensionAPI);
+    const file = join(cwd, "app.ts");
+    writeFileSync(file, "const x = 1;\n");
+    const s = statSync(file);
+    // A read persisted by a previous, now-resumed session — the new instance's
+    // ledger is empty until session_start rebuilds it from this entry.
+    (host.api.appendEntry as (type: string, data: unknown) => void)("yolo-read", { path: file, size: s.size, mtimeMs: s.mtimeMs });
+    await host.fire("session_start", { type: "session_start", reason: "resume" });
+    await host.run("yolo", "approve");
+    // The stat on disk matches the recorded read, so the edit is not blind.
+    assert.equal(await host.toolCall("edit", { path: file, oldString: "x", newString: "y" }), undefined);
+    assert.equal(host.confirms.length, 0, "no 'unread file' prompt after a rebuild");
+  } finally {
+    if (prev === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = prev;
+    rmSync(cwd, { recursive: true, force: true });
+    rmSync(agentDir, { recursive: true, force: true });
+  }
+});
+
+test("f186: a file whose stat drifted from the recorded read is flagged stale, not fresh", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pify-yolo-reads-"));
+  const agentDir = mkdtempSync(join(tmpdir(), "pify-yolo-agent-"));
+  const prev = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+  try {
+    const host = new StubHost({ cwd, hasUI: true, confirm: false });
+    yolo(host.api as unknown as ExtensionAPI);
+    const file = join(cwd, "app.ts");
+    writeFileSync(file, "const x = 1;\n");
+    // The recorded read saw a DIFFERENT size/mtime than what is on disk now —
+    // the file changed since. Rebuilding from the current stat would hide that;
+    // persisting the at-read stat preserves it.
+    (host.api.appendEntry as (type: string, data: unknown) => void)("yolo-read", { path: file, size: 999, mtimeMs: 1 });
+    await host.fire("session_start", { type: "session_start", reason: "resume" });
+    await host.run("yolo", "approve");
+    const denied = await host.toolCall("edit", { path: file, oldString: "x", newString: "y" });
+    assert.equal(host.confirms.length, 1);
+    assert.match(host.confirms[0]!.title, /changed since it was read/i);
+    assert.equal(denied?.block, true, "declined stale edit is blocked");
+  } finally {
+    if (prev === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = prev;
+    rmSync(cwd, { recursive: true, force: true });
+    rmSync(agentDir, { recursive: true, force: true });
   }
 });
 

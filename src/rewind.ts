@@ -27,20 +27,36 @@ export interface RewindPoint {
   /** Dangling commit holding the tree as it stood, for code rewind. */
   stashSha: string | null;
   gitHead: string | null;
+  /** The tree was clean at prompt time, so gitHead is the tree to restore. */
+  cleanAtHead: boolean;
+  /**
+   * The commit a code rewind restores from: the stash if one was taken, else
+   * HEAD when the tree was clean at prompt time. Null when neither holds — a
+   * dirty tree whose checkpoint failed offers no code rewind, because HEAD is
+   * not the tree that was there and restoring it would destroy uncommitted work.
+   */
+  treeSha: string | null;
 }
 
 export function rewindPoints(entries: readonly TrailEntry[]): RewindPoint[] {
   return entries
     .filter((e) => e.type === "prompt")
     .sort((a, b) => b.seq - a.seq)
-    .map((e) => ({
-      seq: e.seq,
-      timestamp: e.timestamp,
-      prompt: e.target,
-      entryId: typeof e.entryId === "string" && e.entryId ? e.entryId : null,
-      stashSha: e.stashSha ?? null,
-      gitHead: e.gitHead ?? null,
-    }));
+    .map((e) => {
+      const stashSha = e.stashSha ?? null;
+      const gitHead = e.gitHead ?? null;
+      const cleanAtHead = e.cleanAtHead === true;
+      return {
+        seq: e.seq,
+        timestamp: e.timestamp,
+        prompt: e.target,
+        entryId: typeof e.entryId === "string" && e.entryId ? e.entryId : null,
+        stashSha,
+        gitHead,
+        cleanAtHead,
+        treeSha: stashSha ?? (cleanAtHead && gitHead ? gitHead : null),
+      };
+    });
 }
 
 /** Local wall-clock stamp — the clock the person at the keyboard lives in. */
@@ -64,7 +80,7 @@ export function formatRewindList(points: readonly RewindPoint[], limit: number):
     return "No prompts recorded yet in this project. A checkpoint is taken each time you send one.";
   }
   const rows = points.slice(0, limit).map((point, index) => {
-    const has = [point.stashSha ? "code" : null, point.entryId ? "conversation" : null]
+    const has = [point.treeSha ? "code" : null, point.entryId ? "conversation" : null]
       .filter(Boolean)
       .join(" + ");
     return `${index + 1}. ${when(point.timestamp)}  ${point.prompt}\n     can restore: ${has || "nothing — no tree change and no session entry"}`;
@@ -99,14 +115,14 @@ export const RESTORE_LABELS: Record<RestoreChoice, string> = {
 };
 
 /**
- * Only offer what this checkpoint can actually deliver. A prompt sent with a
- * clean tree has no stash to come back to, and one recorded before the
- * session entry could be resolved has nothing to navigate to; offering either
- * would be a menu entry that does nothing.
+ * Only offer what this checkpoint can actually deliver. A code rewind needs a
+ * tree to go back to — a stash, or HEAD when the tree was clean at prompt time;
+ * a conversation rewind needs the session entry the message became. Offering
+ * either when it is not there would be a menu entry that does nothing.
  */
 export function restoreChoices(point: RewindPoint): RestoreChoice[] {
   const choices: RestoreChoice[] = [];
-  if (point.stashSha) choices.push("code");
+  if (point.treeSha) choices.push("code");
   if (point.entryId) choices.push("conversation");
   if (choices.length === 2) choices.push("both");
   return choices;
@@ -117,8 +133,9 @@ export function restoreSummary(point: RewindPoint, choice: RestoreChoice): strin
   const lines = [`Rewind to ${when(point.timestamp)}:`, `  ${point.prompt}`, ""];
   if (choice === "code" || choice === "both") {
     lines.push(
-      `The working tree goes back to how it stood then (from ${point.stashSha?.slice(0, 8)}).`,
+      `The working tree goes back to how it stood then (from ${point.treeSha?.slice(0, 8)}).`,
       "Anything written since — by you or by the agent — is overwritten, and work never committed is not recoverable afterwards.",
+      "Files created after the checkpoint are left in place — the snapshot did not include them.",
     );
   }
   if (choice === "conversation" || choice === "both") {

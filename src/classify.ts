@@ -11,6 +11,8 @@
  * here comes from the rules, and the model is an extra pair of eyes.
  */
 
+import type { Mode } from "./types.ts";
+
 export type Risk = "safe" | "risky";
 
 export interface Classification {
@@ -33,22 +35,59 @@ export const CLASSIFY_SYSTEM_PROMPT = [
   "Do not explain. Do not use markdown. Your entire reply must start with { and end with }.",
 ];
 
-/** Commands so common that asking a model about them is pure latency. */
+/**
+ * Commands so common that asking a model about them is pure latency.
+ *
+ * `git branch` and `git remote` are matched only in their read-only forms and
+ * only to the end of the command: `git branch` / `-a` / `-r` / `-v` / `-vv` /
+ * `--list` / `--show-current` / `--contains X` inspect, but `git branch -m`,
+ * `-f`, `-D` and `git remote remove|rename|set-url|prune` mutate refs and must
+ * fall through so strict mode asks. Everything else is a bare prefix match.
+ */
 const OBVIOUSLY_SAFE =
-  /^(git (status|log|diff|show|branch|remote|fetch)|ls|pwd|cat|head|tail|wc|grep|rg|find|which|echo|node -v|npm (ls|view|test)|bun (test|--version)|python -V|cd|whoami|date|env)\b/i;
+  /^(?:(?:git (?:status|log|diff|show|fetch)|ls|pwd|cat|head|tail|wc|grep|rg|find|which|echo|node (?:-v|--version)|npm (?:ls|view|test)|bun (?:test|--version)|python -V|cd|whoami|date|env)\b|git branch(?:\s+(?:-a|-r|-v|-vv|--list|--show-current|--contains\s+\S+))*\s*$|git remote(?:\s+(?:-v|show(?:\s+\S+)?|get-url\s+\S+))?\s*$)/i;
 
 /** Flags that turn a read-only-looking command into an executor. */
 const EXECUTOR_FLAGS = /\s-(exec|execdir|delete|ok|okdir)\b/i;
+
+/**
+ * A `>`/`>>` that writes a file — the mutation the read-only list must never
+ * wave through. `2>/dev/null` (a digit before `>`) and `2>&1` / `>&2` (a `>&`
+ * fd-duplication) are plumbing, not a file write, so they are excluded.
+ */
+const FILE_REDIRECT = /(^|[^\d\\])>(?!&)/;
 
 /** Should the classifier be consulted for this command at all? */
 export function needsClassification(command: string): boolean {
   const trimmed = command.trim();
   if (!trimmed) return false;
-  // A pipeline or chain hides its real work; always look at those.
-  if (/[|;&]|&&|\$\(|`/.test(trimmed)) return true;
+  // A pipeline or chain hides its real work; always look at those. `&` counts
+  // only as backgrounding/chaining — the `&` in `2>&1` or `&>` is fd plumbing.
+  if (/[|;]|(?<!>)&(?!>)|\$\(|`/.test(trimmed)) return true;
+  // A redirection that overwrites a file is a mutation, however read-only the
+  // command in front of it looks (`echo x > f`, `env > notes.txt`).
+  if (FILE_REDIRECT.test(trimmed)) return true;
   // `find` is on the safe list, but `find … -exec` is a way to run anything.
   if (EXECUTOR_FLAGS.test(trimmed)) return true;
   return !OBVIOUSLY_SAFE.test(trimmed);
+}
+
+/**
+ * Whether the model classifier should be consulted for this command. It only
+ * escalates allow → ask, and only approve mode can honour that: yolo and auto
+ * allow a `classifier:` rule regardless, and strict already asks about
+ * anything not plainly read-only (needsClassification === true implies not
+ * obviously safe). In those three modes the call is pure latency — a blocking
+ * model round trip that cannot change the outcome — so it is skipped.
+ */
+export function shouldClassify(
+  mode: Mode,
+  classifierEnabled: boolean,
+  verdictAction: GuardAction,
+  command: string,
+): boolean {
+  if (!classifierEnabled || mode !== "approve") return false;
+  return verdictAction === "allow" && needsClassification(command);
 }
 
 export function buildClassifyPrompt(command: string, cwd: string): string {

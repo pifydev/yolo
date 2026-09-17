@@ -119,6 +119,7 @@ export function recordPrompt(
   gitHead: string | null,
   now: number,
   stashSha: string | null = null,
+  cleanAtHead = false,
 ): void {
   try {
     append(dir, {
@@ -131,6 +132,9 @@ export function recordPrompt(
       cwd,
       ...(gitHead ? { gitHead } : {}),
       ...(stashSha ? { stashSha } : {}),
+      // Only when git confirmed a clean tracked tree: HEAD is then the tree to
+      // rewind to, even though there was nothing to stash.
+      ...(cleanAtHead ? { cleanAtHead: true } : {}),
       ...(entryId ? { entryId } : {}),
     });
   } catch {
@@ -145,30 +149,83 @@ export interface UndoResult {
 }
 
 /**
- * Restore the newest `count` file pre-images (newest first). Files that did
- * not exist before their change are deleted. Bash entries cannot be undone
- * and are skipped. Returns what happened for reporting.
+ * The file entries a `/yolo undo [count]` would restore next, newest first.
+ * Entries already consumed by a previous undo (listed in an "undo" marker's
+ * `undone`) are excluded, so repeating undo steps FURTHER back rather than
+ * re-applying the same pre-image. Undo markers themselves are never files.
+ */
+export function pendingUndo(entries: TrailEntry[], count: number): TrailEntry[] {
+  const consumed = new Set<number>();
+  for (const e of entries) {
+    if (e.type === "undo" && Array.isArray(e.undone)) for (const s of e.undone) consumed.add(s);
+  }
+  return entries
+    .filter((e) => e.type === "file" && !consumed.has(e.seq))
+    .sort((a, b) => b.seq - a.seq)
+    .slice(0, count);
+}
+
+/**
+ * Restore the next `count` file pre-images not already undone (newest first).
+ * Files that did not exist before their change are deleted. Bash entries
+ * cannot be undone and are skipped. On success one "undo" marker is appended
+ * recording the seqs consumed — so the next undo steps back to the ones before
+ * these, instead of restoring the same files again — and holding a snapshot of
+ * the newest overwritten file so the retention pass reclaims it like any other.
  */
 export function undo(dir: string, count: number): UndoResult {
   const result: UndoResult = { restored: [], deleted: [], skipped: [] };
-  const entries = readManifest(dir)
-    .filter((e) => e.type === "file")
-    .sort((a, b) => b.seq - a.seq)
-    .slice(0, count);
+  const entries = pendingUndo(readManifest(dir), count);
+  if (entries.length === 0) return result;
+
+  const markerSeq = nextSeq(dir);
+  const undone: number[] = [];
+  let snapshot: string | null = null;
 
   for (const entry of entries) {
     try {
       if (entry.existed && entry.saved) {
+        // Snapshot the content we are about to overwrite (once per undo, of the
+        // newest file) so the marker owns a saved copy prune can reclaim.
+        if (snapshot === null && existsSync(entry.target)) {
+          const name = `${markerSeq}-undo-${basename(entry.target).slice(0, 80)}`;
+          try {
+            mkdirSync(dir, { recursive: true });
+            writeFileSync(join(dir, name), readFileSync(entry.target));
+            snapshot = name;
+          } catch {
+            snapshot = null;
+          }
+        }
         writeFileSync(entry.target, readFileSync(join(dir, entry.saved)));
         result.restored.push(entry.target);
+        undone.push(entry.seq);
       } else if (!entry.existed && existsSync(entry.target)) {
         unlinkSync(entry.target);
         result.deleted.push(entry.target);
+        undone.push(entry.seq);
       } else {
         result.skipped.push(entry.target);
       }
     } catch {
       result.skipped.push(entry.target);
+    }
+  }
+
+  if (undone.length > 0) {
+    const names = [...result.restored, ...result.deleted].map((p) => basename(p)).join(", ");
+    try {
+      append(dir, {
+        seq: markerSeq,
+        timestamp: Date.now(),
+        type: "undo",
+        target: `undid ${undone.length} change(s): ${names}`.slice(0, 500),
+        saved: snapshot,
+        existed: true,
+        undone,
+      });
+    } catch {
+      // A marker that fails to write only costs the step-back; the restore held.
     }
   }
   return result;
@@ -185,6 +242,9 @@ export function formatTrail(entries: TrailEntry[], limit: number): string {
       }
       if (e.type === "prompt") {
         return `#${e.seq} ${when} you   ${e.target}`;
+      }
+      if (e.type === "undo") {
+        return `#${e.seq} ${when} undo  ${e.target}`;
       }
       const head = e.gitHead ? ` @${e.gitHead.slice(0, 8)}` : "";
       const stash = e.stashSha ? `\n    ↩ git stash apply ${e.stashSha}` : "";

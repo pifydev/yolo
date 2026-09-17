@@ -46,8 +46,11 @@ import {
   buildClassifyPrompt,
   needsClassification,
   parseClassification,
+  shouldClassify,
   type Classification,
 } from "../src/classify.ts";
+import { checkpointSha, decideCheckpoint, type CheckpointResult } from "../src/checkpoint.ts";
+import { classifyDelegation, delegationTarget, isDelegationTool } from "../src/delegation.ts";
 import { evaluateCommand, evaluatePath, parseUserRules } from "../src/rules.ts";
 import { grepFileCandidates, grepSearchRoot, withholdSecretMatches } from "../src/grep.ts";
 import { withUiLock } from "../src/ui-lock.ts";
@@ -73,6 +76,7 @@ import {
 import {
   DEFAULT_RETENTION_DAYS,
   formatTrail,
+  pendingUndo,
   pruneTrail,
   readManifest,
   recordBash,
@@ -96,6 +100,8 @@ const DEFAULT_MODE: Mode = "approve";
 
 const MODE_ENTRY = "yolo-mode";
 const CLASSIFIER_ENTRY = "yolo-classifier";
+/** Persisted read/write observations, so the ledger survives resume/reload. */
+const READ_ENTRY = "yolo-read";
 /** In front of every bash call: a slow answer costs seconds, not minutes. */
 const CLASSIFY_TIMEOUT_MS = 20_000;
 
@@ -147,19 +153,17 @@ export default function yolo(pi: ExtensionAPI) {
    * Snapshot the working tree into a dangling commit before a risky command.
    * `git stash create` writes nothing to the tree, the index, or the stash
    * list — it just gives us a sha to come back to. A ref keeps it out of gc's
-   * reach; empty output means there was nothing to save.
+   * reach. Empty output means either a clean tree (HEAD is the tree to restore)
+   * or a failed checkpoint; decideCheckpoint tells the two apart so a rewind
+   * never mistakes a lock-held failure for a safely-clean tree.
    */
-  function gitCheckpoint(cwd: string, now: number): string | null {
-    try {
-      const sha = execFileSync("git", ["stash", "create"], {
-        cwd,
-        encoding: "utf8",
-        timeout: 5000,
-        windowsHide: true,
-      }).trim();
-      if (!/^[0-9a-f]{7,40}$/.test(sha)) return null;
+  function gitCheckpoint(cwd: string, now: number): CheckpointResult {
+    const runGit = (args: string[]): string =>
+      execFileSync("git", args, { cwd, encoding: "utf8", timeout: 5000, windowsHide: true }).toString();
+    const result = decideCheckpoint(runGit);
+    if ("sha" in result) {
       try {
-        execFileSync("git", ["update-ref", `refs/pify/yolo/${now}`, sha], {
+        execFileSync("git", ["update-ref", `refs/pify/yolo/${now}`, result.sha], {
           cwd,
           timeout: 5000,
           windowsHide: true,
@@ -167,10 +171,8 @@ export default function yolo(pi: ExtensionAPI) {
       } catch {
         // unreachable-but-recent commits still survive the default gc window
       }
-      return sha;
-    } catch {
-      return null;
     }
+    return result;
   }
 
   /**
@@ -179,6 +181,30 @@ export default function yolo(pi: ExtensionAPI) {
    * not knowledge this agent has.
    */
   const reads = new ReadLedger();
+
+  /** Record what the agent saw AND persist it, so the ledger can be rebuilt. */
+  function noteRead(path: string, seen: { size: number; mtimeMs: number }): void {
+    reads.note(path, seen);
+    // The ledger is per-instance and pi re-runs the factory on /new, /resume,
+    // /reload and /fork, so it starts empty after a resume even though the
+    // transcript already holds the reads. Persisting each observation lets
+    // session_start rebuild it — with the stat AS SEEN, so a file that changed
+    // since is still correctly flagged stale rather than silently judged fresh.
+    pi.appendEntry(READ_ENTRY, { path, size: seen.size, mtimeMs: seen.mtimeMs });
+  }
+
+  /** Rebuild the read ledger from the persisted branch (last observation wins). */
+  function rebuildReads(ctx: UiContext): void {
+    reads.clear();
+    for (const entry of ctx.sessionManager.getBranch()) {
+      const e = entry as { type?: string; customType?: string; data?: unknown };
+      if (e.type !== "custom" || e.customType !== READ_ENTRY || !isRecord(e.data)) continue;
+      const { path, size, mtimeMs } = e.data;
+      if (typeof path === "string" && typeof size === "number" && typeof mtimeMs === "number") {
+        reads.note(path, { size, mtimeMs });
+      }
+    }
+  }
 
   function statOf(path: string): { size: number; mtimeMs: number } | null {
     try {
@@ -417,9 +443,9 @@ Go ahead anyway?`));
         }
         if (event.toolName === "read") {
           // Record what the read is about to see, so a later edit can tell
-          // whether the file still looks like that.
+          // whether the file still looks like that — and persist it.
           const seen = statOf(path);
-          if (seen) reads.note(path, seen);
+          if (seen) noteRead(path, seen);
         } else {
           const denial = await guardBlindWrite(ctx, event.toolName, path);
           if (denial) return denial;
@@ -452,6 +478,51 @@ Go ahead anyway?`));
       return undefined;
     }
 
+    // Child agents (agent_run/swarm_run/workflow) run with noExtensions:true,
+    // so yolo's hook never fires INSIDE them — a worker child gets full tools
+    // and walks past the floor, the secret gate, the mode gradient and the
+    // trail. We cannot gate its tool calls on this pi, so we gate the SPAWN and
+    // checkpoint the tree before it, so /yolo rewind and the trail can undo
+    // what the child did. Provably read-only delegations (scout/reviewer, no
+    // isolation) mutate nothing and are left alone — no confirm, no checkpoint.
+    if (isDelegationTool(event.toolName)) {
+      const info = classifyDelegation(event.toolName, (event as { input?: unknown }).input);
+      if (!info || info.readOnly) return undefined;
+
+      const checkpoint = (): void => {
+        if (!dir) return;
+        const now = Date.now();
+        recordBash(dir, delegationTarget(info), ctx.cwd, gitHead(ctx.cwd), now, checkpointSha(gitCheckpoint(ctx.cwd, now)), info.tool);
+      };
+
+      // yolo/auto: allow, but take the checkpoint first so the child is undoable.
+      if (mode === "yolo" || mode === "auto") {
+        checkpoint();
+        return undefined;
+      }
+      // approve/strict: confirm the delegation before it spawns.
+      if (!ctx.hasUI) {
+        return {
+          block: true,
+          terminate: true,
+          reason: `yolo guard: ${info.tool} (agent ${info.agent}) can mutate the tree and needs confirmation, but no UI is available (fail-closed deny).`,
+        };
+      }
+      const approved = await withUiLock(() => ctx.ui.confirm(
+        "Delegate to a child agent?",
+        `${info.tool} → ${info.agent}\n${info.taskHead}\n\nThe child runs with its own tools and is NOT gated command-by-command on this pi. Its changes are checkpointed so /yolo rewind and /yolo undo can walk them back. Run it?`,
+      ));
+      if (!approved) {
+        return {
+          block: true,
+          terminate: true,
+          reason: `The user declined the ${info.tool} delegation (agent ${info.agent}) and stopped the turn.`,
+        };
+      }
+      checkpoint();
+      return undefined;
+    }
+
     // pi 0.85 ships `powershell` as a first-class tool with the same {command}
     // input as bash. It walks the identical path: every rule was right about
     // `Remove-Item -Recurse -Force C:\`, and a `!== "bash"` early return meant
@@ -474,7 +545,7 @@ Go ahead anyway?`));
     // exist there as aliases of read-only cmdlets, so the list is not wrong
     // about them, and a cmdlet the list does not know is simply sent to the
     // classifier — which can only escalate, so the worst case is a question.
-    if (classifierEnabled && verdict.action === "allow" && needsClassification(command)) {
+    if (shouldClassify(mode, classifierEnabled, verdict.action, command)) {
       const classification = await classifyCommand(ctx, command);
       const escalated = applyClassification(verdict.action, classification);
       if (escalated.rule) verdict = { action: "ask", rule: escalated.rule };
@@ -492,7 +563,7 @@ Go ahead anyway?`));
     // Log risky commands, with a checkpoint of the tree as it was.
     if (dir && verdict.action !== "allow") {
       const now = Date.now();
-      recordBash(dir, command, ctx.cwd, gitHead(ctx.cwd), now, gitCheckpoint(ctx.cwd, now), shell);
+      recordBash(dir, command, ctx.cwd, gitHead(ctx.cwd), now, checkpointSha(gitCheckpoint(ctx.cwd, now)), shell);
     }
 
     if (action === "allow") return undefined;
@@ -563,7 +634,11 @@ Go ahead anyway?`));
     if (!dir || !prompt) return;
     const leaf = ctx.sessionManager.getLeafId?.() ?? null;
     const now = Date.now();
-    recordPrompt(dir, prompt, leaf, ctx.cwd, gitHead(ctx.cwd), now, gitCheckpoint(ctx.cwd, now));
+    const checkpoint = gitCheckpoint(ctx.cwd, now);
+    // A clean tracked tree has no stash, but HEAD IS that tree — record it so a
+    // rewind can still put the files back after a child or a command mess. A
+    // FAILED checkpoint is not clean and records neither.
+    recordPrompt(dir, prompt, leaf, ctx.cwd, gitHead(ctx.cwd), now, checkpointSha(checkpoint), "clean" in checkpoint);
   });
 
   pi.on("tool_result", async (event, ctx) => {
@@ -608,7 +683,7 @@ Go ahead anyway?`));
     const path = (event as { input?: Record<string, unknown> }).input?.path;
     if (typeof path !== "string") return;
     const now = statOf(path);
-    if (now) reads.note(path, now);
+    if (now) noteRead(path, now);
   });
 
   pi.on("session_start", async (_event, ctx) => {
@@ -630,6 +705,7 @@ Go ahead anyway?`));
         if (typeof e.data.enabled === "boolean") classifierEnabled = e.data.enabled;
       }
     }
+    rebuildReads(ctx);
     updateFooter(ctx);
   });
 
@@ -646,6 +722,7 @@ Go ahead anyway?`));
         if (typeof e.data.enabled === "boolean") classifierEnabled = e.data.enabled;
       }
     }
+    rebuildReads(ctx);
     updateFooter(ctx);
   });
 
@@ -756,16 +833,18 @@ Go ahead anyway?`));
           if (!(await withUiLock(() => ctx.ui.confirm("Rewind", restoreSummary(point, choice))))) return;
 
           if (choice === "code" || choice === "both") {
-            // `git checkout <stash-sha> -- .` writes that tree over the working
-            // directory without moving HEAD or touching the branch, which is
-            // what "put the files back" has to mean here.
+            // `git restore --source=<sha> --worktree -- .` writes that tree over
+            // the working directory without moving HEAD, touching the branch, or
+            // staging every file into the index — which is what "put the files
+            // back" has to mean here. treeSha is the stash, or HEAD for a tree
+            // that was clean at prompt time.
             try {
-              execFileSync("git", ["checkout", point.stashSha as string, "--", "."], {
+              execFileSync("git", ["restore", `--source=${point.treeSha as string}`, "--worktree", "--", "."], {
                 cwd: ctx.cwd,
                 timeout: 30_000,
                 windowsHide: true,
               });
-              ctx.ui.notify(`Working tree restored to ${point.stashSha?.slice(0, 8)}.`, "info");
+              ctx.ui.notify(`Working tree restored to ${point.treeSha?.slice(0, 8)}.`, "info");
             } catch (err) {
               ctx.ui.notify(
                 `Could not restore the tree: ${err instanceof Error ? err.message : String(err)}`,
@@ -802,12 +881,11 @@ Go ahead anyway?`));
         case "undo": {
           if (!ctx.hasUI) return;
           const count = Math.max(1, Math.min(50, Number.parseInt(countRaw ?? "1", 10) || 1));
-          const preview = readManifest(dir)
-            .filter((e) => e.type === "file")
-            .sort((a, b) => b.seq - a.seq)
-            .slice(0, count);
+          // pendingUndo skips entries a previous undo already consumed, so a
+          // repeat /yolo undo steps FURTHER back instead of re-showing the same.
+          const preview = pendingUndo(readManifest(dir), count);
           if (preview.length === 0) {
-            ctx.ui.notify("Nothing to undo — the trail has no file entries.", "warning");
+            ctx.ui.notify("Nothing left to undo — no file changes, or they were already undone.", "warning");
             return;
           }
           const ok = await withUiLock(() => ctx.ui.confirm(

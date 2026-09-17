@@ -37,6 +37,8 @@ Bare `/yolo` still flips between `yolo` and `approve` — the two ends people ac
 
 Fail-closed everywhere: rule-evaluation errors block; ASK without a UI (headless/CI) denies.
 
+"Plainly read-only" — what `strict` waves through and what skips the classifier — is a short list of commands matched at the front of the line, and it is stricter than it looks: a `>`/`>>` that writes a file (`echo x > f`, `env > notes.txt`) disqualifies the whole command however read-only the verb in front of it is (`2>/dev/null` and `2>&1` are plumbing and do not), and `git branch` / `git remote` count only in their listing forms — `git branch -m`, `-D`, `git remote set-url` fall through and ask.
+
 pi's `powershell` tool walks the same gate as `bash` — same tiers, same confirmation, same trail entry (which says `powershell`, so you can tell them apart). It used to walk past it: the gate returned early on any tool that was not literally named `bash`, so `Remove-Item -Recurse -Force C:\` ran unasked in every mode. The obviously-safe list and the classifier prompt are written in bash, which is fine here — `ls`, `cat`, `git` are aliases of read-only cmdlets in PowerShell, and a cmdlet the list does not know simply goes to the classifier, which can only escalate.
 
 ### A wrapper is not a disguise
@@ -119,6 +121,15 @@ Before every risky bash command in a git repo, the trail records a `git stash cr
 
 That covers what `/yolo undo` can't: damage done by a command rather than by an `edit`/`write`.
 
+## Child agents
+
+`agent_run`, `swarm_run` and `workflow` (from `@pify/subagent`, `@pify/swarm`, `@pify/workflow`) spawn child sessions that run with no extensions — so this gate never fires *inside* them. A worker child gets full bash/edit/write and would walk straight past the catastrophic floor, the secret gate, the mode gradient and the trail. pi gives an extension no seam inside a child, so the honest fix is at the boundary: the **spawn** is gated, and the tree is checkpointed before it.
+
+- A delegation to only pi's built-in read-only agents (`scout`, `reviewer`, no isolation) mutates nothing and is left alone — no confirmation, no checkpoint.
+- Anything else — a worker, a custom agent, any `isolation`, any `workflow` (a script can spawn anything), a swarm with an item that is not plainly read-only — is treated as a mutation: in `yolo` and `auto` it runs after one `git stash create` checkpoint and a trail entry naming the agent and the task head, so `/yolo rewind` can put the tree back afterwards; in `approve` and `strict` it asks first, and a headless session denies (fail-closed, like bash).
+
+The limitation, stated plainly: the child's own tool calls are not gated command by command on this pi, and the gate trusts the agent *name* — a project `.pi/agents/scout.md` that overrides the builtin to write would pass as read-only. Prefer `isolation: "worktree"` for children that edit; it is not a bypass, it is the thing that makes their changes reviewable.
+
 ## The undo trail
 
 Always on, in every mode:
@@ -126,6 +137,8 @@ Always on, in every mode:
 - Every `edit`/`write` saves the file's **pre-image** first (per-project trail under the agent dir — survives restarts).
 - Risky bash commands are logged with cwd, timestamp, and git HEAD.
 - `/yolo trail` shows history; `/yolo undo [n]` restores the newest n file changes (with a confirmation listing exactly what will be touched). Files that didn't exist before are deleted; bash effects are logged but not undoable.
+- **Undo steps back.** Each undo writes an `undo` marker naming the entries it consumed, so the next `/yolo undo` restores the changes *before* those instead of re-applying the same pre-images — repeating it walks further into the past, the way a person expects. The marker also keeps a snapshot of the newest file it overwrote, reclaimed by the same retention as everything else; the trail shows it as `undo  undid 2 change(s): a.ts, b.ts`.
+- **What the agent has read survives a resume.** The "you have not read this file" guard used to forget everything on `/resume`, `/reload` or `/new` — every edit of an already-read file asked again, and a read from the previous session could vouch for a blind write in this one. Each read (and each successful write/edit) is now recorded in the session with the file's size and mtime *as seen*, and the ledger is rebuilt from that on start: an unchanged file edits without a prompt, a file that changed since the read is correctly flagged stale.
 
 ## Rewind to before you asked
 
@@ -144,13 +157,13 @@ Picking one asks what to restore, offering only what that checkpoint can actuall
 - **the conversation only** — the session moves to just before that message, the files stay;
 - **both**.
 
-A prompt sent with a clean tree has no stash to return to, so it does not offer one; a prompt whose message left no session entry does not offer the conversation. The confirmation says which of those you are about to do and what it costs — a tree restore overwrites anything written since and uncommitted work is not recoverable afterwards, while moving the conversation deletes nothing, because the later turns stay reachable in the session tree.
+A prompt sent with a clean tracked tree has no stash — but HEAD *is* that tree, so it is offered as the thing to come back to (the most common rewind: start from a fresh commit, the agent makes a mess). Empty output from `git stash create` is only trusted as "clean" once `git status` agrees; a checkpoint that *failed* (a held `index.lock`, a timeout on a huge repo) records neither and offers no tree restore, because restoring HEAD over a dirty tree would destroy uncommitted work the confirmation promised was captured. The restore uses `git restore --source=<sha> --worktree`, so nothing is staged into the index, and files created after the checkpoint are left in place — the snapshot never held them. A prompt whose message left no session entry does not offer the conversation. The confirmation says which of those you are about to do and what it costs — a tree restore overwrites anything written since and uncommitted work is not recoverable afterwards, while moving the conversation deletes nothing, because the later turns stay reachable in the session tree.
 
 Checkpoints live on the same trail as everything else, so they inherit the same 30-day retention and the same ref cleanup.
 
 ## AI classifier (opt-in)
 
-`/yolo classifier on` adds a third tier behind the regexes. Regexes only know the destructive shapes someone thought to write down — `find . -name '*.ts' -exec sed -i … {} +` is not one of them. When no rule matches, a model reads the command and can raise it to a confirmation.
+`/yolo classifier on` adds a third tier behind the regexes. Regexes only know the destructive shapes someone thought to write down — `find . -name '*.ts' -exec sed -i … {} +` is not one of them. When no rule matches, a model reads the command and can raise it to a confirmation — in **approve** mode, the only mode that can honour an escalation. It is not consulted in yolo or auto (an `ask` from it is allowed there anyway) or in strict (anything not plainly read-only already asks), where the call would be a paid, blocking model round trip that cannot change the outcome.
 
 Two rules keep it honest:
 

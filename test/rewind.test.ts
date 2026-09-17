@@ -45,8 +45,16 @@ test("a checkpoint only offers what it can actually deliver", () => {
   const full = rewindPoints([entry({ seq: 1, entryId: "e1", stashSha: "sha" })])[0]!;
   assert.deepEqual(restoreChoices(full), ["code", "conversation", "both"]);
 
-  // A prompt sent with a clean tree has no stash to come back to.
-  const noTree = rewindPoints([entry({ seq: 1, entryId: "e1" })])[0]!;
+  // A clean tree at prompt time has no stash, but gitHead IS the tree to
+  // restore, so a code rewind is still offered via HEAD.
+  const clean = rewindPoints([entry({ seq: 1, entryId: "e1", gitHead: "headsha1", cleanAtHead: true })])[0]!;
+  assert.equal(clean.treeSha, "headsha1");
+  assert.deepEqual(restoreChoices(clean), ["code", "conversation", "both"]);
+
+  // A failed checkpoint (no stash, not confirmed clean) offers no code rewind:
+  // HEAD is not the tree that was there, so restoring it could destroy work.
+  const noTree = rewindPoints([entry({ seq: 1, entryId: "e1", gitHead: "headsha1" })])[0]!;
+  assert.equal(noTree.treeSha, null);
   assert.deepEqual(restoreChoices(noTree), ["conversation"]);
 
   const noEntry = rewindPoints([entry({ seq: 1, stashSha: "sha" })])[0]!;

@@ -7,6 +7,7 @@ import {
   applyClassification,
   needsClassification,
   parseClassification,
+  shouldClassify,
 } from "../src/classify.ts";
 import {
   MODES,
@@ -451,4 +452,112 @@ test("v0.5 prune is a no-op on a fresh or empty trail, and can be disabled", () 
 
 test("v0.5 checkpointRef matches what the extension published", () => {
   assert.equal(checkpointRef(1757160000000), "refs/pify/yolo/1757160000000");
+});
+
+// ── f187: strict mode looks at redirection and mutating git forms ──────────
+
+const strictAction = (command: string) =>
+  resolveAction({
+    mode: "strict",
+    verdict: evaluateCommand(command),
+    obviouslySafe: !needsClassification(command),
+  });
+
+test("f187 strict asks about file redirection and mutating git branch/remote forms", () => {
+  for (const command of [
+    "echo x > f",
+    "cat <<'EOF' > f",
+    "env > notes.txt",
+    "git branch -m a b",
+    "git branch -f main HEAD~20",
+    "git remote set-url origin https://evil",
+    "git remote remove origin",
+  ]) {
+    assert.equal(strictAction(command), "ask", command);
+  }
+});
+
+test("f187 strict still allows read-only git forms and fd plumbing", () => {
+  for (const command of [
+    "git branch",
+    "git branch -a",
+    "git branch --show-current",
+    "git remote",
+    "git remote -v",
+    "git remote show origin",
+    "ls 2>/dev/null",
+    "node --version 2>&1",
+  ]) {
+    assert.equal(strictAction(command), "allow", command);
+  }
+});
+
+// ── f188: the classifier is consulted only where it can change the verdict ──
+
+test("f188 shouldClassify fires only in approve mode, for an allow verdict it can escalate", () => {
+  const command = "npx some-unknown-tool --write";
+  assert.equal(needsClassification(command), true, "precondition: this command is unfamiliar");
+  assert.equal(shouldClassify("approve", true, "allow", command), true);
+  // The three modes where an escalation cannot change the outcome skip the call.
+  for (const mode of ["yolo", "auto", "strict"] as const) {
+    assert.equal(shouldClassify(mode, true, "allow", command), false, mode);
+  }
+  // And never when it is off, the verdict is not allow, or the command is obvious.
+  assert.equal(shouldClassify("approve", false, "allow", command), false);
+  assert.equal(shouldClassify("approve", true, "ask", command), false);
+  assert.equal(shouldClassify("approve", true, "allow", "git status"), false);
+});
+
+// ── f189: /yolo undo steps back instead of re-applying the newest ──────────
+
+test("f189 repeating undo(1) restores a different entry each time", () => {
+  const base = mkdtempSync(join(tmpdir(), "pify-yolo-undo-"));
+  const dir = join(base, "trail");
+  try {
+    const a = join(base, "a.txt");
+    const b = join(base, "b.txt");
+    writeFileSync(a, "a0");
+    writeFileSync(b, "b0");
+    recordPreImage(dir, a, 1000);
+    writeFileSync(a, "a1");
+    recordPreImage(dir, b, 2000);
+    writeFileSync(b, "b1");
+
+    assert.deepEqual(undo(dir, 1).restored, [b], "first undo takes the newest");
+    assert.equal(readFileSync(b, "utf8"), "b0");
+    // The second undo must step back to a.txt, not re-restore b.txt.
+    assert.deepEqual(undo(dir, 1).restored, [a], "second undo steps back");
+    assert.equal(readFileSync(a, "utf8"), "a0");
+    // A third has nothing left.
+    assert.deepEqual(undo(dir, 1), { restored: [], deleted: [], skipped: [] });
+
+    const text = formatTrail(readManifest(dir), 20);
+    assert.match(text, /undo\s+undid 1 change/);
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("f189 the undo marker's saved snapshot is reclaimed by prune", () => {
+  const base = mkdtempSync(join(tmpdir(), "pify-yolo-undo2-"));
+  const dir = join(base, "trail");
+  const day = 86_400_000;
+  try {
+    const f = join(base, "x.txt");
+    writeFileSync(f, "v0");
+    recordPreImage(dir, f, 1000);
+    writeFileSync(f, "v1");
+    undo(dir, 1);
+
+    const marker = readManifest(dir).find((e) => e.type === "undo");
+    assert.ok(marker && marker.saved, "the undo marker owns a saved snapshot");
+    assert.ok(existsSync(join(dir, marker!.saved!)), "the snapshot is on disk");
+
+    // Prune everything (cutoff far in the future) and the snapshot goes with it.
+    const result = pruneTrail(dir, Date.now() + 40 * day, 30);
+    assert.ok(result.files >= 1);
+    assert.ok(!existsSync(join(dir, marker!.saved!)), "the snapshot is reclaimed");
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
 });

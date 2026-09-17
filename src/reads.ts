@@ -53,6 +53,11 @@ export class ReadLedger {
     this.seen.delete(this.key(path));
   }
 
+  /** Drop everything, for a session_start rebuild from the persisted branch. */
+  clear(): void {
+    this.seen.clear();
+  }
+
   get size(): number {
     return this.seen.size;
   }
