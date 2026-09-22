@@ -21,7 +21,22 @@ export interface StubOptions {
   hasUI?: boolean;
   /** Answer every confirm dialog with this; default true. */
   confirm?: boolean;
+  /**
+   * The active model. Omit for a usable stub model; pass `null` for "no model
+   * available" so the classifier short-circuits before any stream call.
+   */
+  model?: unknown;
 }
+
+/** The final message shape the classifier reads out of a streamSimple call. */
+export interface StubMessage {
+  content?: Array<{ type: string; text?: string }>;
+  stopReason: string;
+  errorMessage?: string;
+}
+
+/** A stub model good enough for `ctx.model` — the classifier only passes it through. */
+const DEFAULT_MODEL = { provider: "stub", modelId: "stub-1" };
 
 export class StubHost {
   readonly commands = new Map<string, (args: string, ctx: unknown) => Promise<void> | void>();
@@ -29,6 +44,18 @@ export class StubHost {
   readonly entries: Entry[] = [];
   readonly notices: Array<{ message: string; level: string }> = [];
   readonly confirms: Array<{ title: string; message: string }> = [];
+  /** Every streamSimple call the classifier made, for asserting it was (or was not) reached. */
+  readonly streamCalls: Array<{ context: unknown; options: unknown }> = [];
+
+  /**
+   * The classifier's one model call. A test overrides this to shape the reply:
+   * return a `{ result }` whose `result()` resolves to a StubMessage, or throw
+   * synchronously to stand in for streamSimple's auth-missing throw. Default:
+   * a well-formed "safe" JSON answer.
+   */
+  streamSimpleImpl: (context: unknown, options: unknown) => { result: () => Promise<StubMessage> } = () => ({
+    result: async () => ({ content: [{ type: "text", text: '{"risk":"safe","reason":"stub"}' }], stopReason: "stop" }),
+  });
 
   private readonly opts: StubOptions;
 
@@ -54,10 +81,20 @@ export class StubHost {
 
   /** The context handed to command handlers and event hooks. */
   get ctx(): Record<string, unknown> {
+    const model = "model" in this.opts ? this.opts.model ?? undefined : DEFAULT_MODEL;
     return {
       cwd: this.opts.cwd ?? "/repo",
       hasUI: this.opts.hasUI ?? false,
       isProjectTrusted: () => true,
+      model,
+      // The migrated classifier calls ctx.modelRegistry.streamSimple and awaits
+      // .result(); this is the only registry surface it touches.
+      modelRegistry: {
+        streamSimple: (_model: unknown, context: unknown, options: unknown) => {
+          this.streamCalls.push({ context, options });
+          return this.streamSimpleImpl(context, options);
+        },
+      },
       sessionManager: {
         getBranch: () => this.entries,
         getLeafId: () => null,

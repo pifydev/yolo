@@ -7,6 +7,7 @@ import {
   applyClassification,
   needsClassification,
   parseClassification,
+  runClassification,
   shouldClassify,
 } from "../src/classify.ts";
 import {
@@ -305,6 +306,36 @@ test("v0.3 the classifier can only escalate, never approve", () => {
   // and it can never soften an ask or a block, whatever it says
   assert.deepEqual(applyClassification("ask", safe), { action: "ask", rule: null });
   assert.deepEqual(applyClassification("block", safe), { action: "block", rule: null });
+});
+
+test("v0.4 runClassification folds every model outcome into a Classification", async () => {
+  // A well-formed answer is parsed as usual.
+  const risky = await runClassification(async () => ({
+    text: '{"risk":"risky","reason":"rewrites history"}',
+    stopReason: "stop",
+  }));
+  assert.deepEqual(risky, { risk: "risky", reason: "rewrites history", fallback: false });
+
+  // A failure encoded in the reply (setup/auth) is a fallback, not an escalation.
+  const errored = await runClassification(async () => ({ text: "", stopReason: "error", errorMessage: "no key" }));
+  assert.equal(errored.fallback, true);
+  assert.match(errored.reason, /failed.*no key/);
+
+  // The timeout signal firing surfaces as an aborted reply — also a fallback.
+  const aborted = await runClassification(async () => ({ text: "", stopReason: "aborted" }));
+  assert.equal(aborted.fallback, true);
+  assert.match(aborted.reason, /timed out/);
+
+  // A synchronous throw (streamSimple with missing auth) is caught as a fallback.
+  const thrown = await runClassification(async () => {
+    throw new Error("No API key found");
+  });
+  assert.equal(thrown.fallback, true);
+  assert.match(thrown.reason, /classifier unavailable.*No API key/);
+
+  // A success-shaped reply with unreadable text still falls back (parse decides).
+  const noise = await runClassification(async () => ({ text: "who knows", stopReason: "stop" }));
+  assert.equal(noise.fallback, true);
 });
 
 test("v0.3 parseClassification reads prose answers, not just JSON", () => {

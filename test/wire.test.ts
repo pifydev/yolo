@@ -99,6 +99,119 @@ test("powershell: the trail entry names the shell, so /yolo trail says powershel
   }
 });
 
+// ── AI classifier through streamSimple ───────────────────────────────────
+//
+// The classifier only escalates allow → ask, so every failure shape — a throw
+// (auth missing), an "error"/"aborted" stopReason, an unreadable answer, or no
+// model at all — must leave the deterministic verdict standing. A benign
+// pipeline (`|`) has an allow verdict but needs classification, so it is the
+// command that reaches the model in approve mode with the classifier on.
+const CLASSIFY_CMD = "cat notes.txt | sort";
+
+async function bootClassifier(cwd: string, opts: { hasUI?: boolean; confirm?: boolean; model?: unknown } = {}): Promise<StubHost> {
+  const host = new StubHost({ cwd, ...opts });
+  yolo(host.api as unknown as ExtensionAPI);
+  // Default mode is approve — only turn the classifier on.
+  await host.run("yolo", "classifier on");
+  return host;
+}
+
+test("classifier: a 'safe' answer leaves the allow verdict standing, and the model was consulted", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pify-yolo-clf-"));
+  try {
+    const host = await bootClassifier(cwd);
+    host.streamSimpleImpl = () => ({
+      result: async () => ({ content: [{ type: "text", text: '{"risk":"safe","reason":"read-only"}' }], stopReason: "stop" }),
+    });
+    assert.equal(await host.toolCall("bash", { command: CLASSIFY_CMD }), undefined);
+    assert.equal(host.streamCalls.length, 1, "the model was consulted exactly once");
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("classifier: a 'risky' answer escalates allow → ask in approve mode", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pify-yolo-clf-"));
+  try {
+    // With a UI and a yes, the escalation surfaces as a confirmation dialog.
+    const host = await bootClassifier(cwd, { hasUI: true, confirm: true });
+    host.streamSimpleImpl = () => ({
+      result: async () => ({ content: [{ type: "text", text: '{"risk":"risky","reason":"mass edit"}' }], stopReason: "stop" }),
+    });
+    assert.equal(await host.toolCall("bash", { command: CLASSIFY_CMD }), undefined, "a yes lets the escalated command run");
+    assert.equal(host.confirms.length, 1, "the escalation asked");
+    assert.match(host.confirms[0]!.message, /classifier:mass edit/);
+    assert.match(host.confirms[0]!.message, /cat notes\.txt \| sort/);
+
+    // Headless, the same escalation is a fail-closed deny that stops the turn.
+    const headless = await bootClassifier(cwd);
+    headless.streamSimpleImpl = () => ({
+      result: async () => ({ content: [{ type: "text", text: '{"risk":"risky","reason":"mass edit"}' }], stopReason: "stop" }),
+    });
+    const denied = await headless.toolCall("bash", { command: CLASSIFY_CMD });
+    assert.equal(denied?.block, true);
+    assert.match(denied?.reason ?? "", /classifier:mass edit/);
+    assert.match(denied?.reason ?? "", /no UI is available/);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("classifier: an 'error' stopReason (setup failure) leaves the deterministic verdict standing", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pify-yolo-clf-"));
+  try {
+    const host = await bootClassifier(cwd);
+    host.streamSimpleImpl = () => ({
+      result: async () => ({ content: [], stopReason: "error", errorMessage: "No API key found for \"stub\"" }),
+    });
+    // allow stands: the command runs, no escalation invented from a failed call.
+    assert.equal(await host.toolCall("bash", { command: CLASSIFY_CMD }), undefined);
+    assert.equal(host.streamCalls.length, 1);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("classifier: an 'aborted' stopReason (timeout signal) leaves the deterministic verdict standing", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pify-yolo-clf-"));
+  try {
+    const host = await bootClassifier(cwd);
+    host.streamSimpleImpl = () => ({
+      result: async () => ({ content: [], stopReason: "aborted" }),
+    });
+    assert.equal(await host.toolCall("bash", { command: CLASSIFY_CMD }), undefined);
+    assert.equal(host.streamCalls.length, 1);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("classifier: a synchronous throw from streamSimple (auth missing) leaves the verdict standing", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pify-yolo-clf-"));
+  try {
+    const host = await bootClassifier(cwd);
+    host.streamSimpleImpl = () => {
+      // streamSimple may throw synchronously when request auth is missing.
+      throw new Error("No API key found for \"stub\"");
+    };
+    assert.equal(await host.toolCall("bash", { command: CLASSIFY_CMD }), undefined);
+    assert.equal(host.streamCalls.length, 1, "the throw happened at the call site, so it was reached");
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("classifier: no model available short-circuits before any stream call, verdict stands", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pify-yolo-clf-"));
+  try {
+    const host = await bootClassifier(cwd, { model: null });
+    assert.equal(await host.toolCall("bash", { command: CLASSIFY_CMD }), undefined);
+    assert.equal(host.streamCalls.length, 0, "no model, no call");
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
 test("grep: a secret search path is gated like a read, in every mode", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "pify-yolo-wire-"));
   try {

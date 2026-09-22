@@ -180,6 +180,58 @@ export function parseClassification(text: string): Classification {
   return { risk: "safe", reason: `unreadable classifier answer: ${trimmed.slice(0, 80)}`, fallback: true };
 }
 
+/** The final message the classifier's model call resolved to. */
+export interface ModelReply {
+  /** Concatenated text of the assistant's answer. */
+  text: string;
+  /** "stop"/"length"/… on success; "error"/"aborted" when the call failed or timed out. */
+  stopReason: string;
+  /** Provider/runtime detail on a failed or aborted reply. */
+  errorMessage?: string;
+}
+
+/**
+ * The one dependency the classifier needs: ask the model once and hand back the
+ * reply, or throw. A throw stands for a setup failure (auth missing) — with
+ * streamSimple that can surface either as a synchronous throw or as an error
+ * stopReason, and both must land as a fallback. Injecting it keeps
+ * runClassification pure: a test stubs this, no session or provider in sight.
+ */
+export type CallModel = () => Promise<ModelReply>;
+
+/**
+ * Drive the classifier through an injectable model call and fold the outcome
+ * into a Classification. Every failure shape — a throw (auth missing), an
+ * "error"/"aborted" stopReason (setup failure or the timeout signal firing),
+ * or an answer parseClassification cannot read — yields `fallback: true`, so
+ * the caller keeps the deterministic verdict. The classifier can only ever
+ * escalate, and a fallback escalates nothing.
+ */
+export async function runClassification(call: CallModel): Promise<Classification> {
+  let reply: ModelReply;
+  try {
+    reply = await call();
+  } catch (err) {
+    return {
+      risk: "safe",
+      reason: `classifier unavailable (${err instanceof Error ? err.message : String(err)})`,
+      fallback: true,
+    };
+  }
+  // A failure is encoded IN the reply, not thrown: streamSimple resolves to an
+  // AssistantMessage with stopReason "error" (setup/auth) or "aborted" (our
+  // timeout signal) rather than rejecting. Treat both as "no opinion".
+  if (reply.stopReason === "error" || reply.stopReason === "aborted") {
+    const detail = reply.errorMessage ? ` (${reply.errorMessage})` : "";
+    return {
+      risk: "safe",
+      reason: reply.stopReason === "aborted" ? `classifier timed out${detail}` : `classifier failed${detail}`,
+      fallback: true,
+    };
+  }
+  return parseClassification(reply.text);
+}
+
 export type GuardAction = "allow" | "ask" | "block";
 
 /**

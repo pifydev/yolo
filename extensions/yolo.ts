@@ -27,11 +27,7 @@
  * /yolo session toggle (valdo766hi).
  */
 import {
-  DefaultResourceLoader,
-  SessionManager,
-  createAgentSession,
   getAgentDir,
-  type AgentSession,
   type ExtensionAPI,
   type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
@@ -45,7 +41,7 @@ import {
   applyClassification,
   buildClassifyPrompt,
   needsClassification,
-  parseClassification,
+  runClassification,
   shouldClassify,
   type Classification,
 } from "../src/classify.ts";
@@ -286,58 +282,47 @@ Go ahead anyway?`));
    * Ask a model whether an unmatched command is risky. Short timeout: this
    * sits in front of every bash call, so a slow answer must cost the session
    * seconds, not minutes — and a timeout is simply "no opinion".
+   *
+   * `ctx.modelRegistry.streamSimple` is the whole call: no resource loader, no
+   * in-memory session, no dispose, no abort timer calling session.abort(). We
+   * hand it a Context (the classifier system prompt plus the one user message)
+   * and a real AbortSignal.timeout — the deadline is the signal, and it turns
+   * into an "aborted" stopReason on the resolved message rather than a hung
+   * call. streamSimple resolves auth at request time through every configured
+   * provider, including ones other extensions registered, which the old
+   * createAgentSession path could not see. Setup failures (auth missing) come
+   * back as a synchronous throw OR as an "error" stopReason; runClassification
+   * folds a throw, an error/aborted reply, and an unreadable answer alike into
+   * a fallback so the deterministic verdict stands.
    */
   async function classifyCommand(ctx: UiContext, command: string): Promise<Classification> {
-    let session: AgentSession | null = null;
-    try {
-      // `reload()` is not optional. `createAgentSession` only loads a resource
-      // loader it builds itself; one passed in is used exactly as handed over,
-      // and a fresh DefaultResourceLoader resolves neither `systemPrompt` nor
-      // `appendSystemPrompt` until it loads. Without it the child ran with no
-      // instructions at all — the call succeeds, the model answers, and it
-      // answers as a generic assistant with nothing to say it went wrong.
-      const loader = new DefaultResourceLoader({
-        cwd: ctx.cwd,
-        agentDir: getAgentDir(),
-        noExtensions: true,
-        noPromptTemplates: true,
-        noThemes: true,
-        // Replace the coding-agent prompt rather than append to it: with
-        // the default prompt in place, models answer a classification
-        // request with a markdown explanation instead of the JSON line.
-        systemPrompt: CLASSIFY_SYSTEM_PROMPT.join(" "),
-      } as never);
-      await loader.reload();
-      const created = await createAgentSession({
-      sessionManager: SessionManager.inMemory(ctx.cwd),
-      model: ctx.model as never,
-      tools: [],
-      resourceLoader: loader,
-      });
-      session = created.session;
-      await session.prompt(buildClassifyPrompt(command, ctx.cwd), {
-        signal: AbortSignal.timeout(CLASSIFY_TIMEOUT_MS),
-      } as never);
-      const messages = session.messages as Array<{ role?: string; content?: Array<{ type?: string; text?: string }> }>;
-      const last = [...messages].reverse().find((m) => m.role === "assistant");
-      const text = (last?.content ?? [])
-        .filter((part) => part.type === "text" && typeof part.text === "string")
+    const model = ctx.model;
+    if (!model) {
+      return { risk: "safe", reason: "classifier unavailable (no model available)", fallback: true };
+    }
+    return runClassification(async () => {
+      // The classifier wants a fast JSON verdict, and the old child session set
+      // no thinking level, so `reasoning` is omitted here — the model's default
+      // applies, exactly as before. A signal is the deadline: no timer to clean
+      // up, and prompt()'s "ignores the signal and resolves anyway" is gone.
+      const stream = ctx.modelRegistry.streamSimple(
+        model,
+        {
+          // Replace the prompt rather than append: with a coding-agent prompt
+          // in place, models answer a classification with a markdown
+          // explanation instead of the one JSON line the parser wants.
+          systemPrompt: CLASSIFY_SYSTEM_PROMPT.join(" "),
+          messages: [{ role: "user", content: buildClassifyPrompt(command, ctx.cwd), timestamp: Date.now() }],
+        },
+        { signal: AbortSignal.timeout(CLASSIFY_TIMEOUT_MS) },
+      );
+      const result = await stream.result();
+      const text = (result.content ?? [])
+        .filter((part): part is { type: "text"; text: string } => part.type === "text" && typeof (part as { text?: unknown }).text === "string")
         .map((part) => part.text)
         .join("");
-      return parseClassification(text);
-    } catch (err) {
-      return {
-        risk: "safe",
-        reason: `classifier unavailable (${err instanceof Error ? err.message : String(err)})`,
-        fallback: true,
-      };
-    } finally {
-      try {
-        session?.dispose();
-      } catch {
-        // best-effort
-      }
-    }
+      return { text, stopReason: result.stopReason, errorMessage: result.errorMessage };
+    });
   }
 
   /**
