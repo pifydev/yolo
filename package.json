@@ -1,7 +1,7 @@
 {
   "name": "@pify/yolo",
-  "version": "0.13.0",
-  "description": "One toggle to auto-approve everything, with an undo trail: three-tier bash guard, file pre-images, fail-closed everywhere",
+  "version": "0.13.1",
+  "description": "A safety gradient from auto-approve-everything to ask-about-anything: four modes, read-before-write, undo trail, rewind to before a prompt",
   "keywords": [
     "pi-package",
     "pi-extension",
