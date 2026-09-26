@@ -73,6 +73,7 @@ export function resolveAction({ mode, verdict, obviouslySafe }: ResolveInput): G
 /** Explains a mode-driven decision in the confirmation dialog. */
 export function askTitle(mode: Mode, verdict: RuleHit): string {
   if (verdict.rule.startsWith("secret:")) return "Command touches secret material";
+  if (verdict.rule.startsWith("bypass:")) return "Bash side door around a guarded tool";
   if (mode === "strict" && verdict.action === "allow") return "Strict mode — unrecognised command";
   return "Destructive command";
 }

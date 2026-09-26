@@ -34,7 +34,7 @@ import {
 import { execFileSync } from "node:child_process";
 import { readFileSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 
 import {
   CLASSIFY_SYSTEM_PROMPT,
@@ -51,6 +51,8 @@ import { evaluateCommand, evaluatePath, parseUserRules } from "../src/rules.ts";
 import { grepFileCandidates, grepSearchRoot, withholdSecretMatches } from "../src/grep.ts";
 import { withUiLock } from "../src/ui-lock.ts";
 import { ReadLedger, assessBlindWrite, blindTitle } from "../src/reads.ts";
+import { generatedMarker, readHead } from "../src/generated.ts";
+import { bypassAdvice, detectBypass } from "../src/bypass.ts";
 import {
   RESTORE_LABELS,
   clipPrompt,
@@ -251,6 +253,38 @@ Go ahead anyway?`));
     };
   }
 
+  /** Generated files the user already said yes to; asking again on every edit would be nagging. */
+  const generatedOk = new Set<string>();
+
+  /**
+   * Ask before editing a file that says it is generated. A question, not a
+   * wall, on the same gradient as the blind-write guard: the fast modes run,
+   * the careful ones ask, quoting the line that declares it.
+   */
+  async function guardGenerated(
+    ctx: UiContext,
+    path: string,
+  ): Promise<{ block: true; reason: string } | undefined> {
+    if (mode === "yolo" || mode === "auto") return undefined;
+    if (generatedOk.has(path)) return undefined;
+    // Creating a file is never editing a generated one.
+    if (statOf(path) === null) return undefined;
+    const marker = generatedMarker(readHead(path));
+    if (!marker) return undefined;
+    const why = `${path} says it is generated ("${marker}"): the next build overwrites the change and the diff misleads everyone. Change the generator or its input instead.`;
+    if (!ctx.hasUI) {
+      return { block: true, reason: `yolo guard: ${why} No UI to confirm (fail-closed deny).` };
+    }
+    const approved = await withUiLock(() => ctx.ui.confirm("Generated file", `${why}
+
+Go ahead anyway?`));
+    if (approved) {
+      generatedOk.add(path);
+      return undefined;
+    }
+    return { block: true, reason: `The user declined. ${why}` };
+  }
+
   /** Confirmation gate for a file path (secret material). */
   async function guardPath(
     ctx: UiContext,
@@ -434,6 +468,8 @@ Go ahead anyway?`));
         } else {
           const denial = await guardBlindWrite(ctx, event.toolName, path);
           if (denial) return denial;
+          const generated = await guardGenerated(ctx, path);
+          if (generated) return generated;
           // A write that creates a file means the agent authored its
           // contents, so an immediate follow-up edit is not blind.
           if (event.toolName === "write" && statOf(path) === null) reads.note(path, { size: 0, mtimeMs: 0 });
@@ -521,6 +557,29 @@ Go ahead anyway?`));
 
     let verdict = evaluateCommand(command, userRules);
 
+    // Bash as a side door: the same action the dedicated tools guard, taken
+    // through a shell instead. A recursive grep over a tree prints what the
+    // grep tool would have withheld; an in-place editor rewrites what the
+    // edit guard would have called blind or stale. Escalate allow → ask
+    // (the mode gradient then decides, as for any ask) and say what to use.
+    if (verdict.action === "allow") {
+      const bypass = detectBypass(command);
+      if (bypass?.kind === "grep-sweep") {
+        verdict = { action: "ask", rule: bypass.rule };
+      } else if (bypass?.kind === "inplace-edit") {
+        const unverified = bypass.paths.some((p) => {
+          const raw = p.replace(/^["']|["']$/g, "");
+          if (/[*?[]/.test(raw)) return true; // a glob cannot be checked against the ledger
+          const abs = isAbsolute(raw) ? raw : join(ctx.cwd, raw);
+          const onDisk = statOf(abs);
+          if (onDisk === null) return false; // a new file is never blind
+          // The ledger keys on the path as the read tool spelled it; try both spellings.
+          return !assessBlindWrite("edit", raw, onDisk, reads).ok && !assessBlindWrite("edit", abs, onDisk, reads).ok;
+        });
+        if (unverified) verdict = { action: "ask", rule: bypass.rule };
+      }
+    }
+
     // Layer 3: a model looks at what the regexes had no opinion about. It can
     // only escalate allow → ask, so a talked-into-it classifier cannot open
     // the gate, and a broken one leaves the deterministic verdict standing.
@@ -561,6 +620,7 @@ Go ahead anyway?`));
     }
 
     // ASK tier.
+    const hint = verdict.rule.startsWith("bypass:") ? ` ${bypassAdvice(verdict.rule)}` : "";
     if (!ctx.hasUI) {
       // No one to answer: deny AND stop. Continuing would leave the model
       // retrying cosmetic variants of a command it can never get approved,
@@ -568,7 +628,7 @@ Go ahead anyway?`));
       return {
         block: true,
         terminate: true,
-        reason: `yolo guard: '${verdict.rule}' needs confirmation but no UI is available (fail-closed deny). No approval is possible in this run.`,
+        reason: `yolo guard: '${verdict.rule}' needs confirmation but no UI is available (fail-closed deny). No approval is possible in this run.${hint}`,
       };
     }
     const approved = await withUiLock(() => ctx.ui.confirm(
@@ -588,8 +648,8 @@ Go ahead anyway?`));
       block: true,
       terminate: true,
       reason: reason?.trim()
-        ? `The user declined (${verdict.rule}) and stopped the turn: ${reason.trim()}`
-        : `The user declined this command (${verdict.rule}) and stopped the turn.`,
+        ? `The user declined (${verdict.rule}) and stopped the turn: ${reason.trim()}${hint}`
+        : `The user declined this command (${verdict.rule}) and stopped the turn.${hint}`,
     };
   });
 

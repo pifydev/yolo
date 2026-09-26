@@ -1,6 +1,6 @@
 {
   "name": "@pify/yolo",
-  "version": "0.13.1",
+  "version": "0.14.0",
   "description": "A safety gradient from auto-approve-everything to ask-about-anything: four modes, read-before-write, undo trail, rewind to before a prompt",
   "keywords": [
     "pi-package",
