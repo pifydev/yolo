@@ -15,9 +15,9 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 import yolo from "../extensions/yolo.ts";
 import { formatTrail, readManifest, trailDir } from "../src/trail.ts";
-import { StubHost } from "./host.ts";
+import { StubHost, type StubTools } from "./host.ts";
 
-function boot(opts: { cwd: string; hasUI?: boolean; confirm?: boolean }): StubHost {
+function boot(opts: { cwd: string; hasUI?: boolean; confirm?: boolean; tools?: StubTools }): StubHost {
   const host = new StubHost(opts);
   yolo(host.api as unknown as ExtensionAPI);
   return host;
@@ -428,6 +428,39 @@ test("generated file: an edit asks in approve mode (quoting the marker), runs in
     assert.equal(ui.confirms.filter((c) => c.title === "Generated file").length, 1);
     assert.equal(await ui.toolCall("edit", { path: generated, oldString: "1", newString: "2" }), undefined);
     assert.equal(ui.confirms.filter((c) => c.title === "Generated file").length, 1, "asked once, not on every edit");
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("MCP tools (pi 0.99): read-only runs, destructive or unannotated asks in approve mode, everything runs in yolo mode", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pify-yolo-wire-"));
+  try {
+    const tools: StubTools = [
+      { name: "get_issue", namespace: { name: "mcp__jira" }, annotations: { readOnlyHint: true } },
+      { name: "delete_issue", namespace: { name: "mcp__jira" }, annotations: { destructiveHint: true } },
+      { name: "mcp__slack__post_message" },
+      { name: "memory_save" },
+    ];
+    const host = boot({ cwd, tools });
+    await host.run("yolo", "approve");
+    assert.equal(await host.toolCall("get_issue", { id: 1 }), undefined, "read-only runs");
+    const denied = await host.toolCall("delete_issue", { id: 1 });
+    assert.equal(denied?.block, true);
+    assert.match(denied?.reason ?? "", /mcp:destructive/);
+    const bare = await host.toolCall("mcp__slack__post_message", { text: "hi" });
+    assert.equal(bare?.block, true);
+    assert.match(bare?.reason ?? "", /mcp:unannotated/);
+    assert.equal(await host.toolCall("memory_save", { text: "x" }), undefined, "the suite's own tools are not MCP tools");
+    await host.run("yolo", "yolo");
+    assert.equal(await host.toolCall("delete_issue", { id: 1 }), undefined);
+
+    const ui = boot({ cwd, hasUI: true, confirm: true, tools });
+    await ui.run("yolo", "approve");
+    assert.equal(await ui.toolCall("delete_issue", { id: 1 }), undefined);
+    assert.equal(ui.confirms.filter((c) => c.title === "MCP tool").length, 1);
+    assert.equal(await ui.toolCall("delete_issue", { id: 2 }), undefined);
+    assert.equal(ui.confirms.filter((c) => c.title === "MCP tool").length, 1, "a yes covers the tool for the session");
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }

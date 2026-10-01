@@ -16,6 +16,8 @@ export interface Entry {
   data: unknown;
 }
 
+export type StubTools = Array<{ name: string; namespace?: { name: string }; annotations?: Record<string, boolean> }>;
+
 export interface StubOptions {
   cwd?: string;
   hasUI?: boolean;
@@ -26,6 +28,8 @@ export interface StubOptions {
    * available" so the classifier short-circuits before any stream call.
    */
   model?: unknown;
+  /** What pi.getAllTools() reports (pi 0.99 adds namespace and annotations). */
+  tools?: StubTools;
 }
 
 /** The final message shape the classifier reads out of a streamSimple call. */
@@ -70,6 +74,7 @@ export class StubHost {
         this.commands.set(name, spec.handler);
       },
       registerTool: () => {},
+      getAllTools: () => this.opts.tools ?? [],
       on: (event: string, handler: (e: unknown, c: unknown) => Promise<unknown> | unknown) => {
         this.handlers.set(event, handler);
       },

@@ -53,6 +53,7 @@ import { withUiLock } from "../src/ui-lock.ts";
 import { ReadLedger, assessBlindWrite, blindTitle } from "../src/reads.ts";
 import { generatedMarker, readHead } from "../src/generated.ts";
 import { bypassAdvice, detectBypass } from "../src/bypass.ts";
+import { describeHints, isMcpTool, mcpVerdict, previewArgs, type ToolInfoLike } from "../src/mcp.ts";
 import {
   RESTORE_LABELS,
   clipPrompt,
@@ -255,6 +256,19 @@ Go ahead anyway?`));
 
   /** Generated files the user already said yes to; asking again on every edit would be nagging. */
   const generatedOk = new Set<string>();
+
+  /** MCP tools the user already said yes to this session. */
+  const mcpOk = new Set<string>();
+
+  /** What pi knows about a registered tool — namespace and annotations since 0.99; undefined before. */
+  function lookupTool(name: string): ToolInfoLike | undefined {
+    try {
+      const all = (pi as unknown as { getAllTools?: () => ToolInfoLike[] }).getAllTools?.() ?? [];
+      return all.find((t) => t.name === name);
+    } catch {
+      return undefined;
+    }
+  }
 
   /**
    * Ask before editing a file that says it is generated. A question, not a
@@ -497,6 +511,30 @@ Go ahead anyway?`));
         }
       }
       return undefined;
+    }
+
+    // pi 0.99: MCP servers' tools reach the model with the hints their server
+    // declared. They used to walk past the gate in every mode; now they sit
+    // on the gradient like a shell command — read-only runs, destructive or
+    // unannotated asks, yolo/auto run everything, and a yes is remembered
+    // for the tool. Calls a codemode script makes arrive here too.
+    const toolInfo = lookupTool(event.toolName);
+    if (isMcpTool(toolInfo, event.toolName)) {
+      const verdict = mcpVerdict(toolInfo?.annotations);
+      if (verdict.action === "allow" || mode === "yolo" || mode === "auto" || mcpOk.has(event.toolName)) return undefined;
+      const summary = `${event.toolName}${toolInfo?.namespace && typeof toolInfo.namespace.name === "string" ? ` (${toolInfo.namespace.name})` : ""}\n${previewArgs((event as { input?: unknown }).input)}\n\nHints: ${describeHints(toolInfo?.annotations)}.`;
+      if (!ctx.hasUI) {
+        return {
+          block: true,
+          reason: `yolo guard: '${verdict.rule}' — ${event.toolName} is an MCP tool that may change something outside this repository, and there is no UI to confirm (fail-closed deny).`,
+        };
+      }
+      const approved = await withUiLock(() => ctx.ui.confirm("MCP tool", `${summary}\n\nRun it? (a yes covers this tool for the session)`));
+      if (approved) {
+        mcpOk.add(event.toolName);
+        return undefined;
+      }
+      return { block: true, reason: `The user declined ${event.toolName} (${verdict.rule}). Do not retry it; ask the user what they want instead.` };
     }
 
     // Child agents (agent_run/swarm_run/workflow) run with noExtensions:true,

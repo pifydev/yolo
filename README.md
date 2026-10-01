@@ -136,6 +136,10 @@ That covers what `/yolo undo` can't: damage done by a command rather than by an 
 
 The limitation, stated plainly: the child's own tool calls are not gated command by command on this pi, and the gate trusts the agent *name* — a project `.pi/agents/scout.md` that overrides the builtin to write would pass as read-only. Prefer `isolation: "worktree"` for children that edit; it is not a bypass, it is the thing that makes their changes reviewable.
 
+## MCP tools
+
+pi 0.99 connects MCP servers and declares their tools to the model, each with the hints its server chose — read-only, destructive, idempotent, open world. These used to walk past the gate in every mode. Now they sit on the gradient like a shell command: a tool that says it is read-only runs; one that says it is destructive asks, with the server, the arguments and the hints in the dialog; one that says nothing asks too, because the protocol's default for a missing hint is "may be destructive, reaches an open world". A yes covers that tool for the rest of the session. `yolo` and `auto` run everything, as they do every non-secret risk; headless runs fail closed. Calls a `codemode` script makes arrive at the same gate one by one. The suite's own tools are not MCP tools and are unaffected.
+
 ## The undo trail
 
 Always on, in every mode:
