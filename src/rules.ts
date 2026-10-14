@@ -79,7 +79,8 @@ const DESTRUCTIVE: BuiltinRule[] = [
   { name: "git-hook-bypass", action: "ask", re: /\bgit\b[^|;&]*\s--no-v(?:e(?:r(?:i(?:f(?:y)?)?)?)?)?(?=[\s=]|$)/ },
   { name: "git-hook-bypass", action: "ask", re: /\bgit\s+(?:-[^\s|;&]+\s+)*commit\b[^|;&]*\s-[A-Za-z]*n[A-Za-z]*(?=\s|$)/ },
   { name: "git-hooks-path", action: "ask", re: /\bgit\b[^|;&]*\s(?:-c|--config-env)[=\s]+["']?(?:core\.hookspath|include\.path|includeif\.[^\s='"]*\.path)\b/i },
-  { name: "git-hooks-path", action: "ask", re: /\bgit\s+config\b[^|;&]*\b(?:core\.hookspath|include\.path|includeif\.[^\s='"]*\.path)\b/i },
+  // `git config --get core.hooksPath` only reads it; the setting forms ask.
+  { name: "git-hooks-path", action: "ask", re: /\bgit\s+config\b(?![^|;&]*(?:--(?:get|get-all|get-regexp|list|show-origin|show-scope)\b|\s-l\b))[^|;&]*\b(?:core\.hookspath|include\.path|includeif\.[^\s='"]*\.path)\b/i },
   { name: "git-hooks-path", action: "ask", re: /\bGIT_CONFIG_(?:PARAMETERS|KEY_\d+)=["']*(?:core\.hookspath|include\.path|includeif\.[^\s='"]*\.path)\b/i },
   // Windows destructive shapes. `rmdir`/`rd` and `del` recurse a whole tree
   // with `/s`; PowerShell's `Remove-Item -Recurse` is `rm -rf` by another
