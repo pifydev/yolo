@@ -47,7 +47,7 @@ import {
 } from "../src/classify.ts";
 import { checkpointSha, decideCheckpoint, type CheckpointResult } from "../src/checkpoint.ts";
 import { classifyDelegation, delegationTarget, isDelegationTool } from "../src/delegation.ts";
-import { evaluateCommand, evaluatePath, parseUserRules } from "../src/rules.ts";
+import { evaluateCommand, evaluatePath, parseUserRules, qualityConfigKind } from "../src/rules.ts";
 import { grepFileCandidates, grepSearchRoot, withholdSecretMatches } from "../src/grep.ts";
 import { withUiLock } from "../src/ui-lock.ts";
 import { ReadLedger, assessBlindWrite, blindTitle } from "../src/reads.ts";
@@ -327,6 +327,30 @@ Go ahead anyway?`));
   }
 
   /**
+   * The quality-config guard: an existing linter/formatter config or ignore
+   * file is about to be edited. Asks in approve/strict; headless denies,
+   * because the whole point is that nobody is there to notice the check being
+   * loosened.
+   */
+  async function guardQualityConfig(ctx: UiContext, path: string, kind: string): Promise<{ block: true; reason: string } | undefined> {
+    if (!ctx.hasUI) {
+      return {
+        block: true,
+        reason: `yolo guard: ${path} is an existing ${kind} configuration and there is no UI to confirm the edit (fail-closed deny). Fix the code the check complains about instead.`,
+      };
+    }
+    const approved = await withUiLock(() => ctx.ui.confirm(
+      "Quality config",
+      `${path}\n\nThis is an existing ${kind} configuration (or ignore file). Agents loosen these to make a check pass instead of fixing the code. Allow the edit?`,
+    ));
+    if (approved) return undefined;
+    return {
+      block: true,
+      reason: `The user declined the edit to ${path} (${kind} config). Make the check pass by fixing the code, not the check.`,
+    };
+  }
+
+  /**
    * Ask a model whether an unmatched command is risky. Short timeout: this
    * sits in front of every bash call, so a slow answer must cost the session
    * seconds, not minutes — and a timeout is simply "no opinion".
@@ -480,6 +504,18 @@ Go ahead anyway?`));
           const seen = statOf(path);
           if (seen) noteRead(path, seen);
         } else {
+          // Quality-config guard (ECC): editing an EXISTING linter/formatter
+          // config or ignore file is the file counterpart of the destructive
+          // tier — asks in approve/strict, runs and is trailed in yolo/auto.
+          // First creation passes: configuring a check is not evading one.
+          const quality = qualityConfigKind(path);
+          if (quality && statOf(path) !== null) {
+            const action = resolveAction({ mode, verdict: { action: "ask", rule: `quality-config:${quality}` }, obviouslySafe: false });
+            if (action === "ask") {
+              const denial = await guardQualityConfig(ctx, path, quality);
+              if (denial) return denial;
+            }
+          }
           const denial = await guardBlindWrite(ctx, event.toolName, path);
           if (denial) return denial;
           const generated = await guardGenerated(ctx, path);

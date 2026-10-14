@@ -32,7 +32,7 @@ Bare `/yolo` still flips between `yolo` and `approve` — the two ends people ac
 | Tier | Examples | Behavior |
 |---|---|---|
 | **BLOCK** | `rm -rf /`, `rm -rf ~`, `rm -rf .git`, `mkfs`, `dd of=/dev/…`, fork bomb, `> /dev/sda`, `format C:`/`Format-Volume`/`Clear-Disk`, `Remove-Item -Recurse C:\` | Refused outright, in every mode. Never overridable — not by user rules, not by a mode. |
-| **ASK** | `rm -rf <path>`, `git push --force`, `git reset --hard`, `git clean -f`, `curl \| sh`, `find -delete`, `chmod 777`, history rewrites | Confirmation dialog with the command shown. Denials can carry your reason back to the agent. |
+| **ASK** | `rm -rf <path>`, `git push --force`, `git reset --hard`, `git clean -f`, `curl \| sh`, `find -delete`, `chmod 777`, history rewrites, git hook bypasses (`--no-verify` and its prefixes, `commit -n`, `core.hooksPath` by `-c`/`--config-env`/`git config`/`GIT_CONFIG_*`) | Confirmation dialog with the command shown. Denials can carry your reason back to the agent. |
 | ALLOW | everything else | Runs untouched (unless you are in `strict`). |
 
 Fail-closed everywhere: rule-evaluation errors block; ASK without a UI (headless/CI) denies.
@@ -85,6 +85,13 @@ A file that says it is generated — `@generated`, `DO NOT EDIT`, `Code generate
 | `⚙ auto` | runs |
 | `🛡 approve` *(default)* | asks |
 | `🔒 strict` | asks |
+
+## Git hooks and quality configs
+
+Two more things an agent does when a check will not pass — instead of fixing the code — and both now sit in the destructive tier (ask in `approve`/`strict`, run and trailed in `yolo`/`auto`, retunable by your rules; from ECC's hook set):
+
+- **Skipping git hooks.** Every route git offers: `--no-verify` and any prefix git accepts for it (`--no-v`…), the `-n` short form of `git commit` alone or in a cluster (`-an`, `-nm`), and moving the hooks directory out from under the gate — `-c`/`--config-env` with `core.hooksPath`, an `include.path`/`includeIf.*.path` pulling in a config that sets it, `git config core.hooksPath …`, or the same keys through `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_n`/`GIT_CONFIG_PARAMETERS`. Ordinary `git commit -am …`, `--amend`, `git log -n 5` and `git config --get` are untouched.
+- **Loosening a linter or formatter.** An `edit`/`write` to an **existing** ESLint, Prettier, Biome, Ruff, shellcheck, stylelint or markdownlint config — or to its ignore file, which is the easier way to make a check pass — asks first. Creating one for the first time passes: configuring a check is not evading one. Headless denies, since nobody is there to notice the rule being turned off.
 
 ## Secret files
 

@@ -67,6 +67,20 @@ const DESTRUCTIVE: BuiltinRule[] = [
   { name: "chmod-777", action: "ask", re: /\bchmod\s+(-\w+\s+)*777\b/ },
   { name: "truncate", action: "ask", re: /\btruncate\s+-s\s*0\b/ },
   { name: "history-rewrite", action: "ask", re: /\bgit\s+(rebase|filter-branch|filter-repo)\b/ },
+  // Git hook bypass (ECC's block-no-verify, at the ask tier). Hooks are the
+  // repository's own quality gate, and an agent that cannot pass one tends to
+  // skip it rather than fix the code. Every route git offers is covered:
+  // `--no-verify` and any prefix git accepts for it (down to `--no-v`), the
+  // `-n` short form of `git commit` alone or in a cluster (`-an`, `-nm`), and
+  // moving the hooks directory out from under the gate — `-c`/`--config-env`
+  // with core.hooksPath, an include.path/includeIf.*.path pulling in a config
+  // that sets it, `git config core.hooksPath`, or the same keys through the
+  // GIT_CONFIG_* environment (seen on the command as written, before unwrap).
+  { name: "git-hook-bypass", action: "ask", re: /\bgit\b[^|;&]*\s--no-v(?:e(?:r(?:i(?:f(?:y)?)?)?)?)?(?=[\s=]|$)/ },
+  { name: "git-hook-bypass", action: "ask", re: /\bgit\s+(?:-[^\s|;&]+\s+)*commit\b[^|;&]*\s-[A-Za-z]*n[A-Za-z]*(?=\s|$)/ },
+  { name: "git-hooks-path", action: "ask", re: /\bgit\b[^|;&]*\s(?:-c|--config-env)[=\s]+["']?(?:core\.hookspath|include\.path|includeif\.[^\s='"]*\.path)\b/i },
+  { name: "git-hooks-path", action: "ask", re: /\bgit\s+config\b[^|;&]*\b(?:core\.hookspath|include\.path|includeif\.[^\s='"]*\.path)\b/i },
+  { name: "git-hooks-path", action: "ask", re: /\bGIT_CONFIG_(?:PARAMETERS|KEY_\d+)=["']*(?:core\.hookspath|include\.path|includeif\.[^\s='"]*\.path)\b/i },
   // Windows destructive shapes. `rmdir`/`rd` and `del` recurse a whole tree
   // with `/s`; PowerShell's `Remove-Item -Recurse` is `rm -rf` by another
   // name. Flags are case-insensitive on Windows, and the payload may arrive
@@ -91,6 +105,35 @@ const SECRET_PATHS: BuiltinRule[] = [
   { name: "private-key", action: "ask", re: /\.(pem|key|p12|pfx|keystore|jks)$/ },
   { name: "secrets-file", action: "ask", re: /(^|\/)(secrets?|credentials)\.(json|ya?ml|toml)$/ },
 ];
+
+/**
+ * Linter and formatter configuration, and the ignore files that decide what
+ * they skip (ECC's config-protection hook). An agent that cannot make a
+ * check pass tends to loosen the check: a rule set to "off", a path added to
+ * the ignore file. Editing one of these that already exists is the file
+ * counterpart of the destructive tier; creating one for the first time is
+ * configuration, not evasion, and the extension lets it pass.
+ */
+const QUALITY_CONFIGS: BuiltinRule[] = [
+  { name: "eslint", action: "ask", re: /(^|\/)(\.eslintrc(\.(js|cjs|mjs|json|ya?ml))?|eslint\.config\.(js|cjs|mjs|ts|cts|mts)|\.eslintignore)$/ },
+  { name: "prettier", action: "ask", re: /(^|\/)(\.prettierrc(\.(js|cjs|mjs|json|json5|ya?ml|toml))?|prettier\.config\.(js|cjs|mjs|ts)|\.prettierignore)$/ },
+  { name: "biome", action: "ask", re: /(^|\/)biome\.jsonc?$/ },
+  { name: "ruff", action: "ask", re: /(^|\/)\.?ruff\.toml$/ },
+  { name: "shellcheck", action: "ask", re: /(^|\/)\.shellcheckrc$/ },
+  { name: "stylelint", action: "ask", re: /(^|\/)(\.stylelintrc(\.(js|cjs|mjs|json|ya?ml))?|stylelint\.config\.(js|cjs|mjs|ts)|\.stylelintignore)$/ },
+  { name: "markdownlint", action: "ask", re: /(^|\/)(\.markdownlint(\.(json|jsonc|ya?ml))?|\.markdownlint-cli2\.(jsonc|ya?ml|cjs|mjs)|\.markdownlintignore)$/ },
+];
+
+/** The quality-config class this path belongs to, or null. Same path folding as the secret rules. */
+export function qualityConfigKind(path: string): string | null {
+  const spelled = path.trim().replace(/^["']|["']$/g, "").replace(/^@/, "").replace(/\\/g, "/");
+  const normalized = foldPath(spelled).toLowerCase();
+  if (!normalized) return null;
+  for (const rule of QUALITY_CONFIGS) {
+    if (rule.re.test(normalized)) return rule.name;
+  }
+  return null;
+}
 
 /** Example/sample templates carry no secrets — never worth a prompt. */
 const SECRET_EXEMPT = /(^|\/)[\w.-]*\.(example|sample|template|dist)$|\.pub$/;

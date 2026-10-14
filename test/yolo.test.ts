@@ -23,8 +23,7 @@ import {
   evaluatePath,
   parseUserRules,
   secretPathKind,
-  wildcardToRegex,
-} from "../src/rules.ts";
+  wildcardToRegex, qualityConfigKind } from "../src/rules.ts";
 import {
   checkpointRef,
   formatTrail,
@@ -70,8 +69,47 @@ test("destructive commands ask", () => {
     "find . -name '*.tmp' -delete",
     "chmod 777 script.sh",
     "git rebase -i HEAD~5",
+    // Git hook bypasses: every route git offers (ECC's block-no-verify).
+    "git commit -m 'wip' --no-verify",
+    "git commit --no-v -m x",
+    "git push --no-verify origin main",
+    "git merge --no-verify feature",
+    "git commit -n -m 'skip hooks'",
+    "git commit -anm 'all, no hooks'",
+    "git -c core.hooksPath=/dev/null commit -m x",
+    "git --config-env=core.hooksPath=HOOKS commit -m x",
+    "git -c include.path=/tmp/evil.gitconfig commit -m x",
+    "git config core.hooksPath /tmp/nohooks",
+    "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0=/dev/null git commit -m x",
+    "GIT_CONFIG_PARAMETERS=\"'core.hooksPath=/dev/null'\" git commit -m x",
   ]) {
     assert.equal(evaluateCommand(cmd).action, "ask", cmd);
+  }
+});
+
+test("quality-config paths are classified; everything else is not", () => {
+  for (const [path, kind] of [
+    [".eslintrc.json", "eslint"],
+    ["eslint.config.mjs", "eslint"],
+    ["packages/app/.eslintignore", "eslint"],
+    [".prettierrc", "prettier"],
+    ["prettier.config.cjs", "prettier"],
+    [".prettierignore", "prettier"],
+    ["biome.json", "biome"],
+    ["biome.jsonc", "biome"],
+    ["ruff.toml", "ruff"],
+    [".ruff.toml", "ruff"],
+    [".shellcheckrc", "shellcheck"],
+    ["stylelint.config.js", "stylelint"],
+    [".markdownlint.yaml", "markdownlint"],
+    [".markdownlint-cli2.jsonc", "markdownlint"],
+    ["./a/../.eslintrc", "eslint"],
+    ["@.prettierrc.yaml", "prettier"],
+  ] as const) {
+    assert.equal(qualityConfigKind(path), kind, path);
+  }
+  for (const path of ["tsconfig.json", "package.json", "src/eslint-rules.ts", "docs/prettier.md", "pyproject.toml", ".env"]) {
+    assert.equal(qualityConfigKind(path), null, path);
   }
 });
 
@@ -84,6 +122,12 @@ test("safe commands allow", () => {
     "npm test",
     "cat README.md | grep x",
     "git branch -d merged-branch",
+    // Ordinary commits and reads keep running: no bypass, no hooks path.
+    "git commit -am 'fix: thing'",
+    "git commit -m 'msg' --amend",
+    "git log -n 5 --oneline",
+    "git config --get core.hooksPath",
+    "git -c diff.color=always diff",
     "",
   ]) {
     assert.equal(evaluateCommand(cmd).action, "allow", cmd);
