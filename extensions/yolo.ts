@@ -142,6 +142,7 @@ export default function yolo(pi: ExtensionAPI) {
         encoding: "utf8",
         timeout: 2000,
         windowsHide: true,
+        stdio: ["ignore", "pipe", "ignore"],
       }).trim();
     } catch {
       return null;
@@ -158,7 +159,7 @@ export default function yolo(pi: ExtensionAPI) {
    */
   function gitCheckpoint(cwd: string, now: number): CheckpointResult {
     const runGit = (args: string[]): string =>
-      execFileSync("git", args, { cwd, encoding: "utf8", timeout: 5000, windowsHide: true }).toString();
+      execFileSync("git", args, { cwd, encoding: "utf8", timeout: 5000, windowsHide: true, stdio: ["ignore", "pipe", "ignore"] }).toString();
     const result = decideCheckpoint(runGit);
     if ("sha" in result) {
       try {
@@ -166,6 +167,7 @@ export default function yolo(pi: ExtensionAPI) {
           cwd,
           timeout: 5000,
           windowsHide: true,
+          stdio: ["ignore", "pipe", "ignore"],
         });
       } catch {
         // unreachable-but-recent commits still survive the default gc window
@@ -405,7 +407,7 @@ Go ahead anyway?`));
   function releaseRefs(cwd: string, refs: string[]): void {
     for (const ref of refs) {
       try {
-        execFileSync("git", ["update-ref", "-d", ref], { cwd, timeout: 5000, windowsHide: true });
+        execFileSync("git", ["update-ref", "-d", ref], { cwd, timeout: 5000, windowsHide: true, stdio: ["ignore", "pipe", "ignore"] });
       } catch {
         // already gone, or not a repo any more
       }
@@ -962,6 +964,7 @@ Go ahead anyway?`));
                 cwd: ctx.cwd,
                 timeout: 30_000,
                 windowsHide: true,
+                stdio: ["ignore", "pipe", "ignore"],
               });
               ctx.ui.notify(`Working tree restored to ${point.treeSha?.slice(0, 8)}.`, "info");
             } catch (err) {
